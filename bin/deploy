@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+Usage:
+  deploy <app_name> <user@host> <local_binary_path>
+
+Example:
+  deploy coolidea root@1.2.3.4 ./build/coolidea
+EOF
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+app="${1:-}"
+host="${2:-}"
+binpath="${3:-}"
+
+[[ -n "$app" ]]     || { usage; exit 1; }
+[[ -n "$host" ]]    || die "missing <user@host>"
+[[ -n "$binpath" ]] || die "missing <local_binary_path>"
+[[ -f "$binpath" ]] || die "binary not found: $binpath"
+
+remote_root="/srv/apps/$app"
+remote_bin="$remote_root/current/$app"
+
+echo "Deploying $app to $host..."
+echo "  local:  $binpath"
+echo "  remote: $remote_bin"
+
+# Ensure remote dirs exist (in case you forgot init)
+ssh "$host" "sudo mkdir -p '$remote_root/current' '$remote_root/shared'"
+
+# Upload binary to a temp path first, then move into place atomically
+tmp="/tmp/${app}.new.$$"
+scp -O "$binpath" "$host:$tmp"
+
+ssh "$host" "sudo mv '$tmp' '$remote_bin' && sudo chmod +x '$remote_bin' && sudo systemctl restart 'app@$app'"
+
+echo "Deployed. Check logs:"
+echo "  ssh $host 'journalctl -u app@$app -f'"
+
