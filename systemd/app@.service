@@ -1,0 +1,27 @@
+[Unit]
+Description=App Service (%i)
+After=network.target
+
+[Service]
+Type=simple
+
+# App name is the instance name (%i)
+WorkingDirectory=/srv/apps/%i/current
+
+# Load per-app environment
+EnvironmentFile=/srv/apps/%i/shared/.env
+
+# Binary name == app name
+ExecStart=/srv/apps/%i/current/%i
+
+# Reliability
+Restart=always
+RestartSec=2
+
+# Security / hygiene
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+
