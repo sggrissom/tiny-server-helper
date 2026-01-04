@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+Usage:
+  appctl init <app_name> <port>
+
+Examples:
+  sudo appctl init new-site 4100
+EOF
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+cmd="${1:-}"
+[[ -n "${cmd}" ]] || { usage; exit 1; }
+
+case "$cmd" in
+  init)
+    app="${2:-}"
+    port="${3:-}"
+
+    [[ -n "$app" ]]  || die "missing <app_name>"
+    [[ -n "$port" ]] || die "missing <port>"
+    [[ "$port" =~ ^[0-9]+$ ]] || die "port must be a number"
+    (( port >= 1 && port <= 65535 )) || die "port out of range"
+
+    root="/srv/apps/$app"
+    rel="$root/releases"
+    shared="$root/shared"
+    current="$root/current"
+
+    echo "Creating directories for $app..."
+    mkdir -p "$rel" "$shared"
+
+    # Create env file if it doesn't exist
+    envfile="$shared/.env"
+    if [[ -f "$envfile" ]]; then
+      echo "Env already exists: $envfile (leaving as-is)"
+    else
+      echo "Writing $envfile..."
+      cat >"$envfile" <<EOF
+PORT=$port
+# Add more config here later:
+# BASE_URL=https://example.com
+# DATABASE_URL=...
+EOF
+      chmod 600 "$envfile"
+    fi
+
+    # Ensure current exists (empty is fine until first deploy)
+    mkdir -p "$current"
+
+    echo "✅ Init complete:"
+    echo "  $root/"
+    echo "    releases/"
+    echo "    shared/.env"
+    echo "    current/"
+
+    echo "Next: deploy a binary to $root/current/$app."
+    echo "To start: sudo systemctl enable --now app@$app"
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
+
