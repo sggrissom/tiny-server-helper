@@ -6,38 +6,56 @@ usage() {
 Usage:
   deploy <app_name> <user@host> <local_binary_path>
 
-Example:
-  deploy coolidea root@1.2.3.4 ./build/coolidea
+Examples:
+  deploy resume vps ./build/resume
 EOF
 }
 
-die() { echo "Error: $*" >&2; exit 1; }
+die(){ echo "Error: $*" >&2; exit 1; }
 
-app="${1:-}"
-host="${2:-}"
-binpath="${3:-}"
-
-[[ -n "$app" ]]     || { usage; exit 1; }
-[[ -n "$host" ]]    || die "missing <user@host>"
-[[ -n "$binpath" ]] || die "missing <local_binary_path>"
+app="${1:-}"; host="${2:-}"; binpath="${3:-}"
+[[ -n "$app" && -n "$host" && -n "$binpath" ]] || { usage; exit 1; }
 [[ -f "$binpath" ]] || die "binary not found: $binpath"
 
+keep=5
+static_dir=""
+
+# Timestamp + git sha if available
+ts="$(date +%Y-%m-%d_%H%M%S)"
+sha="nogit"
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  sha="$(git rev-parse --short HEAD 2>/dev/null || echo nogit)"
+fi
+rel="${ts}_${sha}"
+
 remote_root="/srv/apps/$app"
-remote_bin="$remote_root/current/$app"
+remote_rel="$remote_root/releases/$rel"
+remote_bin="$remote_rel/$app"
 
-echo "Deploying $app to $host..."
-echo "  local:  $binpath"
-echo "  remote: $remote_bin"
+echo "Deploying $app -> $host"
+echo "  release: $rel"
+echo "  keep:    $keep"
+echo "  binary:  $binpath"
 
-# Ensure remote dirs exist (in case you forgot init)
-ssh "$host" "sudo mkdir -p '$remote_root/current' '$remote_root/shared'"
+# Create release dir
+ssh "$host" "sudo mkdir -p '$remote_rel'"
 
-# Upload binary to a temp path first, then move into place atomically
-tmp="/tmp/${app}.new.$$"
+# Upload binary to temp, then move into release dir
+tmp="/tmp/${app}.${rel}.$$"
 scp -O "$binpath" "$host:$tmp"
+ssh "$host" "sudo mv '$tmp' '$remote_bin' && sudo chmod +x '$remote_bin'"
 
-ssh "$host" "sudo mv '$tmp' '$remote_bin' && sudo chmod +x '$remote_bin' && sudo systemctl restart 'app@$app'"
+# Flip current symlink + restart
+ssh "$host" "sudo ln -sfn '$remote_rel' '$remote_root/current' && sudo systemctl restart 'app@$app'"
 
-echo "Deployed. Check logs:"
+# Prune old releases (keep newest N)
+ssh "$host" "set -e;
+  cd '$remote_root/releases';
+  ls -1dt * 2>/dev/null | tail -n +$((keep+1)) | xargs -r sudo rm -rf --"
+
+echo "✅ Done."
+echo "Logs:"
 echo "  ssh $host 'journalctl -u app@$app -f'"
+echo "Current:"
+echo "  ssh $host 'readlink -f $remote_root/current'"
 
