@@ -1,26 +1,33 @@
 [Unit]
 Description=App Service (%i)
 After=network.target
+Wants=network.target
 
 [Service]
 Type=simple
-
-# App name is the instance name (%i)
+User=apps
+Group=apps
 WorkingDirectory=/srv/apps/%i/current
 
-# Load per-app environment
+# App runtime config
 EnvironmentFile=/srv/apps/%i/shared/.env
 
-# Binary name == app name
 ExecStart=/srv/apps/%i/current/%i
 
-# Reliability
-Restart=always
-RestartSec=2
+# Health check: local only, no TLS, no DNS
+ExecStartPost=/usr/bin/curl --fail --silent --max-time 2 \
+  http://127.0.0.1:${PORT}/healthz
 
-# Security / hygiene
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# Hardening (nice-to-have)
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
