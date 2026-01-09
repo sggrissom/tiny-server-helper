@@ -1,77 +1,61 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APPS_USER="${APPS_USER:-apps}"
-APPS_ROOT="${APPS_ROOT:-/srv/apps}"
-
-echo "== bootstrap-vps =="
-
-# 1) Create apps user/group if missing
-if ! id -u "$APPS_USER" >/dev/null 2>&1; then
-  echo "Creating system user: $APPS_USER"
-  sudo useradd --system --home "$APPS_ROOT" --shell /usr/sbin/nologin "$APPS_USER"
-else
-  echo "User exists: $APPS_USER"
-fi
-
-if ! getent group "$APPS_USER" >/dev/null 2>&1; then
-  echo "Creating system group: $APPS_USER"
-  sudo groupadd --system "$APPS_USER"
-else
-  echo "Group exists: $APPS_USER"
-fi
-
-# Ensure user is in its group (harmless if already)
-sudo usermod -a -G "$APPS_USER" "$APPS_USER" || true
-
-# 2) Create standard directories
-echo "Ensuring directory layout..."
-sudo mkdir -p "$APPS_ROOT"
-sudo mkdir -p /etc/caddy/sites
-
-# Ownership for apps root
-sudo chown -R "$APPS_USER:$APPS_USER" "$APPS_ROOT"
-sudo chmod 0755 "$APPS_ROOT"
-
-# 3) Install/Update systemd template unit from repo
-if [[ ! -f systemd/app@.service ]]; then
-  echo "Error: run this from repo root (missing systemd/app@.service)" >&2
-  exit 1
-fi
-
-echo "Installing systemd template: /etc/systemd/system/app@.service"
-sudo cp systemd/app@.service /etc/systemd/system/app@.service
-sudo systemctl daemon-reload
-
-# 4) Ensure Caddyfile imports sites folder (non-destructive)
+APPS_USER="apps"
+APPS_ROOT="/srv/apps"
 CADDYFILE="/etc/caddy/Caddyfile"
 IMPORT_LINE="import /etc/caddy/sites/*.caddy"
 
+echo "== tiny-server-helper bootstrap =="
+
+# 1) Create apps user/group if missing
+if ! getent group "$APPS_USER" >/dev/null 2>&1; then
+  echo "Creating group: $APPS_USER"
+  sudo groupadd --system "$APPS_USER"
+fi
+
+if ! id -u "$APPS_USER" >/dev/null 2>&1; then
+  echo "Creating user: $APPS_USER"
+  sudo useradd --system --home "$APPS_ROOT" --shell /usr/sbin/nologin --gid "$APPS_USER" "$APPS_USER"
+fi
+
+# 2) Standard directories
+echo "Ensuring directories..."
+sudo mkdir -p "$APPS_ROOT"
+sudo mkdir -p /etc/caddy/sites
+
+sudo chown -R "$APPS_USER:$APPS_USER" "$APPS_ROOT"
+sudo chmod 0755 "$APPS_ROOT"
+
+# 3) Install systemd template
+[[ -f systemd/app@.service ]] || { echo "Run from repo root (missing systemd/app@.service)"; exit 1; }
+echo "Installing systemd unit: /etc/systemd/system/app@.service"
+sudo cp systemd/app@.service /etc/systemd/system/app@.service
+sudo systemctl daemon-reload
+
+# 4) Ensure Caddy imports sites folder (append if missing)
 if [[ -f "$CADDYFILE" ]]; then
-  if sudo grep -qF "$IMPORT_LINE" "$CADDYFILE"; then
-    echo "Caddyfile already imports sites folder."
-  else
-    echo "Adding sites import to Caddyfile."
+  if ! sudo grep -qF "$IMPORT_LINE" "$CADDYFILE"; then
+    echo "Adding sites import to $CADDYFILE"
     echo "" | sudo tee -a "$CADDYFILE" >/dev/null
     echo "$IMPORT_LINE" | sudo tee -a "$CADDYFILE" >/dev/null
   fi
 else
-  echo "Creating minimal Caddyfile with sites import."
+  echo "Creating minimal $CADDYFILE"
   echo "$IMPORT_LINE" | sudo tee "$CADDYFILE" >/dev/null
 fi
 
-# 5) Validate/reload Caddy if installed; otherwise print next steps
+# 5) Validate/reload Caddy if installed + running
 if command -v caddy >/dev/null 2>&1; then
   echo "Validating Caddy config..."
   sudo caddy validate --config "$CADDYFILE"
   echo "Reloading Caddy..."
-  sudo systemctl reload caddy || sudo systemctl restart caddy
+  sudo systemctl reload caddy 2>/dev/null || true
 else
-  echo "NOTE: caddy not found. Install it, then:"
+  echo "NOTE: caddy not installed. Install caddy, then:"
   echo "  sudo caddy validate --config $CADDYFILE"
   echo "  sudo systemctl enable --now caddy"
 fi
 
-echo "✅ bootstrap-vps complete."
-echo "Next: sudo appctl init <name> <port>"
+echo "✅ bootstrap complete"
 

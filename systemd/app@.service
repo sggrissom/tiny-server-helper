@@ -1,3 +1,7 @@
+[Unit]
+Description=App Service (%i)
+After=network.target
+
 [Service]
 Type=simple
 User=apps
@@ -11,4 +15,7 @@ Restart=on-failure
 RestartSec=2
 KillSignal=SIGTERM
 TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
 
