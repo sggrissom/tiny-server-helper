@@ -5,9 +5,15 @@ usage() {
   cat <<EOF
 Usage:
   appctl init <app_name> <port>
+  appctl status
+  appctl logs <app_name>
+  appctl rollback <app_name>
 
 Examples:
   sudo appctl init new-site 4100
+  appctl status
+  appctl logs new-site
+  sudo appctl rollback new-site
 EOF
 }
 
@@ -61,6 +67,72 @@ EOF
     echo "Next: deploy a binary to $root/current/$app."
     echo "To start: sudo systemctl enable --now app@$app"
     ;;
+
+  status)
+    apps_dir="/srv/apps"
+    [[ -d "$apps_dir" ]] || die "/srv/apps does not exist"
+
+    for app_path in "$apps_dir"/*/; do
+      [[ -d "$app_path" ]] || continue
+      app="$(basename "$app_path")"
+
+      # Get current release
+      current="$app_path/current"
+      if [[ -L "$current" ]]; then
+        release="$(basename "$(readlink "$current")")"
+      elif [[ -d "$current" ]]; then
+        release="(no release)"
+      else
+        release="(not initialized)"
+      fi
+
+      # Get systemd status
+      if systemctl is-active --quiet "app@$app" 2>/dev/null; then
+        status="running"
+      else
+        status="stopped"
+      fi
+
+      printf "%-20s %-10s %s\n" "$app" "$status" "$release"
+    done
+    ;;
+
+  logs)
+    app="${2:-}"
+    [[ -n "$app" ]] || die "missing <app_name>"
+    exec journalctl -u "app@$app" -f
+    ;;
+
+  rollback)
+    app="${2:-}"
+    [[ -n "$app" ]] || die "missing <app_name>"
+
+    root="/srv/apps/$app"
+    releases_dir="$root/releases"
+    current="$root/current"
+
+    [[ -d "$releases_dir" ]] || die "no releases directory for $app"
+    [[ -L "$current" ]] || die "current is not a symlink - nothing to rollback to"
+
+    current_release="$(basename "$(readlink "$current")")"
+
+    # Get sorted releases (newest last), find the one before current
+    prev_release=""
+    while IFS= read -r rel; do
+      [[ "$rel" == "$current_release" ]] && break
+      prev_release="$rel"
+    done < <(ls -1 "$releases_dir" | sort)
+
+    [[ -n "$prev_release" ]] || die "no previous release to rollback to"
+
+    echo "Rolling back $app: $current_release -> $prev_release"
+
+    ln -sfn "$releases_dir/$prev_release" "$current"
+    systemctl restart "app@$app"
+
+    echo "Rollback complete. Now running: $prev_release"
+    ;;
+
   *)
     usage
     exit 1
