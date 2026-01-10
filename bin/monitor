@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+URL="${1:-https://steven.grissom.zone/healthz}"
+INTERVAL="${2:-}"
+
+check_once() {
+  # prints: code time_total
+  local out
+  out="$(curl -fsS -o /dev/null -w "%{http_code} %{time_total}" --max-time 3 "$URL" 2>/dev/null || true)"
+
+  if [[ -z "$out" ]]; then
+    printf "%-4s %s\n" "DOWN" "$URL"
+    return
+  fi
+
+  local code time
+  code="${out%% *}"
+  time="${out##* }"
+
+  if [[ "$code" == "200" ]]; then
+    printf "%-4s %s (HTTP %s, %ss)\n" "UP" "$URL" "$code" "$time"
+  else
+    printf "%-4s %s (HTTP %s, %ss)\n" "DOWN" "$URL" "$code" "$time"
+  fi
+}
+
+if [[ -z "$INTERVAL" ]]; then
+  check_once
+  exit 0
+fi
+
+# watch mode
+while true; do
+  clear
+  date
+  echo
+  check_once
+  sleep "$INTERVAL"
+done
+
