@@ -1,0 +1,16 @@
+# Monitor TUI Configuration
+# Copy this file to one of the following locations:
+#   - ./sites.toml (current directory)
+#   - ~/.config/monitor/sites.toml
+#   - /etc/monitor/sites.toml
+
+[settings]
+refresh_interval = 5        # Seconds between checks
+history_size = 100          # Number of data points to keep per site
+request_timeout = 3         # HTTP request timeout in seconds
+
+# Define your monitored sites below
+[[sites]]
+name = "Resume Site"
+url = "https://steven.grissom.zone/healthz"
+expected_status = 200
