@@ -4,7 +4,7 @@ mod config;
 mod history;
 mod ui;
 
-use app::{App, AppAction};
+use app::{App, AppAction, View};
 use checker::spawn_checker_task;
 use config::Config;
 use crossterm::{
@@ -69,9 +69,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Main event loop
     loop {
-        // Render UI
+        // Render UI based on current view
         terminal.draw(|frame| {
-            ui::dashboard::render_dashboard(frame, &app);
+            match &app.current_view {
+                View::Dashboard => ui::dashboard::render_dashboard(frame, &app),
+                View::Detail(site_name) => ui::detail::render_detail(frame, &app, site_name),
+            }
         })?;
 
         // Poll for keyboard events with timeout (~60 FPS)

@@ -11,12 +11,20 @@ pub enum AppAction {
     Quit,     // Exit application
 }
 
+/// Current view state
+#[derive(Debug, Clone, PartialEq)]
+pub enum View {
+    Dashboard,
+    Detail(String), // Detail view for a specific site (by name)
+}
+
 /// Main application state
 pub struct App {
     pub config: Config,
     pub sites: IndexMap<String, SiteHistory>,
     pub selected_index: usize,
     pub last_update: DateTime<Utc>,
+    pub current_view: View,
 }
 
 impl App {
@@ -36,6 +44,7 @@ impl App {
             sites,
             selected_index: 0,
             last_update: Utc::now(),
+            current_view: View::Dashboard,
         }
     }
 
@@ -54,30 +63,50 @@ impl App {
             KeyCode::Char('q') => AppAction::Quit,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => AppAction::Quit,
 
-            // Navigate up
-            KeyCode::Up => {
-                if self.sites.is_empty() {
-                    return AppAction::Continue;
-                }
-                if self.selected_index > 0 {
-                    self.selected_index -= 1;
-                } else {
-                    // Wrap around to bottom
-                    self.selected_index = self.sites.len() - 1;
+            // ESC key - return to dashboard
+            KeyCode::Esc => {
+                self.current_view = View::Dashboard;
+                AppAction::Continue
+            }
+
+            // Enter key - open detail view for selected site
+            KeyCode::Enter => {
+                if self.current_view == View::Dashboard {
+                    if let Some((name, _)) = self.selected_site() {
+                        self.current_view = View::Detail(name.clone());
+                    }
                 }
                 AppAction::Continue
             }
 
-            // Navigate down
-            KeyCode::Down => {
-                if self.sites.is_empty() {
-                    return AppAction::Continue;
+            // Navigate up (only in dashboard view)
+            KeyCode::Up => {
+                if self.current_view == View::Dashboard {
+                    if self.sites.is_empty() {
+                        return AppAction::Continue;
+                    }
+                    if self.selected_index > 0 {
+                        self.selected_index -= 1;
+                    } else {
+                        // Wrap around to bottom
+                        self.selected_index = self.sites.len() - 1;
+                    }
                 }
-                if self.selected_index < self.sites.len() - 1 {
-                    self.selected_index += 1;
-                } else {
-                    // Wrap around to top
-                    self.selected_index = 0;
+                AppAction::Continue
+            }
+
+            // Navigate down (only in dashboard view)
+            KeyCode::Down => {
+                if self.current_view == View::Dashboard {
+                    if self.sites.is_empty() {
+                        return AppAction::Continue;
+                    }
+                    if self.selected_index < self.sites.len() - 1 {
+                        self.selected_index += 1;
+                    } else {
+                        // Wrap around to top
+                        self.selected_index = 0;
+                    }
                 }
                 AppAction::Continue
             }

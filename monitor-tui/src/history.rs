@@ -84,4 +84,39 @@ impl SiteHistory {
             .rev()
             .collect()
     }
+
+    /// Get minimum response time from all results
+    pub fn min_response_time(&self) -> Option<u64> {
+        self.results
+            .iter()
+            .filter_map(|r| r.response_time_ms)
+            .min()
+    }
+
+    /// Get maximum response time from all results
+    pub fn max_response_time(&self) -> Option<u64> {
+        self.results
+            .iter()
+            .filter_map(|r| r.response_time_ms)
+            .max()
+    }
+
+    /// Get chart data points for visualization
+    /// Returns (timestamp_seconds, response_time_ms) pairs
+    pub fn chart_data(&self) -> Vec<(f64, f64)> {
+        self.results
+            .iter()
+            .filter_map(|r| {
+                r.response_time_ms.map(|time| {
+                    let timestamp = r.timestamp.timestamp() as f64;
+                    (timestamp, time as f64)
+                })
+            })
+            .collect()
+    }
+
+    /// Get all results (for detailed view)
+    pub fn all_results(&self) -> &VecDeque<CheckResult> {
+        &self.results
+    }
 }
