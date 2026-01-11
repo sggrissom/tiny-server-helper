@@ -8,12 +8,14 @@ Usage:
   appctl status
   appctl logs <app_name>
   appctl rollback <app_name>
+  appctl domain <app_name> <domain>
 
 Examples:
   sudo appctl init new-site 4100
   appctl status
   appctl logs new-site
   sudo appctl rollback new-site
+  sudo appctl domain new-site new-site.com
 EOF
 }
 
@@ -128,6 +130,82 @@ EOF
     systemctl restart "app@$app"
 
     echo "Rollback complete. Now running: $prev_release"
+    ;;
+
+  domain)
+    # Configure Caddy reverse proxy for an app
+    # Reads PORT from app's .env file and creates Caddy config
+    app="${2:-}"
+    domain="${3:-}"
+
+    [[ -n "$app" ]] || die "missing <app_name>"
+    [[ -n "$domain" ]] || die "missing <domain>"
+
+    root="/srv/apps/$app"
+    envfile="$root/shared/.env"
+    caddy_config="/etc/caddy/sites/$app.caddy"
+
+    # Validate app exists
+    [[ -d "$root" ]] || die "app '$app' not found in /srv/apps/"
+
+    # Validate domain format (basic check)
+    [[ "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]] || die "invalid domain format: $domain"
+
+    # Extract PORT from .env
+    [[ -f "$envfile" ]] || die ".env file not found: $envfile"
+    port=$(grep -E "^PORT=" "$envfile" | cut -d= -f2)
+    [[ -n "$port" ]] || die "PORT not found in $envfile"
+    [[ "$port" =~ ^[0-9]+$ ]] || die "PORT must be numeric, got: $port"
+    (( port >= 1 && port <= 65535 )) || die "PORT out of range: $port"
+
+    echo "Configuring Caddy for $app..."
+    echo "  Domain: $domain"
+    echo "  Port: $port"
+
+    # Create Caddy config (atomic write via temp file)
+    temp_config=$(mktemp)
+    cat >"$temp_config" <<EOF
+$domain {
+    reverse_proxy localhost:$port
+}
+EOF
+
+    # Validate Caddy is installed
+    if ! command -v caddy >/dev/null 2>&1; then
+      echo "Warning: caddy not installed. Config created but not validated."
+      mv "$temp_config" "$caddy_config"
+      chmod 644 "$caddy_config"
+      echo "✅ Config written to: $caddy_config"
+      echo "Install caddy and run: sudo systemctl reload caddy"
+      exit 0
+    fi
+
+    # Move config into place
+    mv "$temp_config" "$caddy_config"
+    chmod 644 "$caddy_config"
+
+    # Validate Caddy config
+    echo "Validating Caddy config..."
+    if ! caddy validate --config /etc/caddy/Caddyfile 2>&1; then
+      echo "Error: Caddy config validation failed"
+      echo "Config created at $caddy_config but Caddy not reloaded"
+      exit 1
+    fi
+
+    # Reload Caddy
+    echo "Reloading Caddy..."
+    if systemctl reload caddy 2>&1; then
+      echo "✅ Domain configured successfully"
+      echo "   $domain → localhost:$port"
+      echo ""
+      echo "Next steps:"
+      echo "  1. Ensure DNS points to this server"
+      echo "  2. Caddy will automatically provision SSL certificate"
+      echo "  3. Test: curl https://$domain/healthz"
+    else
+      echo "Warning: Caddy reload failed. Check: sudo systemctl status caddy"
+      exit 1
+    fi
     ;;
 
   *)
