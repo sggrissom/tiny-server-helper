@@ -39,6 +39,7 @@ case "$cmd" in
 
     echo "Creating directories for $app..."
     mkdir -p "$rel" "$shared"
+    chown -R apps:apps "/srv/apps/$app"
 
     # Create env file if it doesn't exist
     envfile="$shared/.env"
@@ -55,16 +56,12 @@ EOF
       chmod 600 "$envfile"
     fi
 
-    # Ensure current exists (empty is fine until first deploy)
-    mkdir -p "$current"
-
     echo "✅ Init complete:"
     echo "  $root/"
     echo "    releases/"
     echo "    shared/.env"
-    echo "    current/"
 
-    echo "Next: deploy a binary to $root/current/$app."
+    echo "Next: deploy a binary (creates current symlink automatically)."
     echo "To start: sudo systemctl enable --now app@$app"
     ;;
 

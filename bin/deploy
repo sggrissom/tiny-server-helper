@@ -39,6 +39,7 @@ prev="$(ssh "$host" "readlink -f '$remote_root/current' || true")"
 
 # Create release dir
 ssh "$host" "sudo mkdir -p '$remote_rel'"
+ssh "$host" "sudo chown -R apps:apps '$remote_rel'"
 
 # Upload binary
 tmp="/tmp/${app}.${rel}.$$"
