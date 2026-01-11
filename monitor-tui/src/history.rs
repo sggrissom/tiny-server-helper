@@ -70,4 +70,18 @@ impl SiteHistory {
     pub fn is_empty(&self) -> bool {
         self.results.is_empty()
     }
+
+    /// Get recent response times for sparkline visualization
+    /// Returns up to the last `limit` response times in chronological order
+    pub fn recent_response_times(&self, limit: usize) -> Vec<u64> {
+        self.results
+            .iter()
+            .rev()
+            .take(limit)
+            .filter_map(|r| r.response_time_ms)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
 }

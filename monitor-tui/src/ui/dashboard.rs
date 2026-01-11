@@ -105,6 +105,33 @@ fn render_site_list(frame: &mut Frame, app: &App, area: Rect) {
                 response_time_str, http_status_str, uptime
             ));
 
+            // Get sparkline data (last 30 data points)
+            let sparkline_data = history.recent_response_times(30);
+            let sparkline_str = if !sparkline_data.is_empty() {
+                // Create a simple ASCII sparkline using Unicode block characters
+                let max_val = sparkline_data.iter().max().unwrap_or(&1);
+                let min_val = sparkline_data.iter().min().unwrap_or(&0);
+                let range = max_val.saturating_sub(*min_val).max(1);
+
+                let chars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+                let sparkline: String = sparkline_data
+                    .iter()
+                    .map(|&val| {
+                        let normalized = if range == 0 {
+                            0
+                        } else {
+                            ((val.saturating_sub(*min_val)) * (chars.len() as u64 - 1) / range) as usize
+                        };
+                        chars[normalized.min(chars.len() - 1)]
+                    })
+                    .collect();
+                format!("  Last checks: {}", sparkline)
+            } else {
+                "  Last checks: (no data)".to_string()
+            };
+
+            let line4 = Line::from(sparkline_str);
+
             // Apply selection highlighting
             let style = if idx == app.selected_index {
                 Style::default()
@@ -114,7 +141,7 @@ fn render_site_list(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default()
             };
 
-            ListItem::new(vec![line1, line2, line3]).style(style)
+            ListItem::new(vec![line1, line2, line3, line4]).style(style)
         })
         .collect();
 
