@@ -12,16 +12,33 @@ use ratatui::{
 
 /// Render the site detail view
 pub fn render_detail(frame: &mut Frame, app: &App, site_name: &str) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    // Determine if we need an error bar
+    let has_error = app.error_message.is_some();
+
+    let constraints = if has_error {
+        vec![
+            Constraint::Length(3),  // Header
+            Constraint::Length(8),  // Site info & current status
+            Constraint::Length(5),  // Statistics
+            Constraint::Min(10),    // Chart
+            Constraint::Length(8),  // Recent checks
+            Constraint::Length(1),  // Error bar
+            Constraint::Length(1),  // Footer
+        ]
+    } else {
+        vec![
             Constraint::Length(3),  // Header
             Constraint::Length(8),  // Site info & current status
             Constraint::Length(5),  // Statistics
             Constraint::Min(10),    // Chart
             Constraint::Length(8),  // Recent checks
             Constraint::Length(1),  // Footer
-        ])
+        ]
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
         .split(frame.size());
 
     render_header(frame, site_name, chunks[0]);
@@ -36,7 +53,12 @@ pub fn render_detail(frame: &mut Frame, app: &App, site_name: &str) {
         }
     }
 
-    render_footer(frame, chunks[5]);
+    if has_error {
+        render_error_bar(frame, app, chunks[5]);
+        render_footer(frame, chunks[6]);
+    } else {
+        render_footer(frame, chunks[5]);
+    }
 }
 
 /// Render the header
@@ -291,9 +313,24 @@ fn render_recent_checks(frame: &mut Frame, history: &SiteHistory, area: Rect) {
     frame.render_widget(list, area);
 }
 
+/// Render the error status bar
+fn render_error_bar(frame: &mut Frame, app: &App, area: Rect) {
+    if let Some(error_msg) = &app.error_message {
+        let error_text = format!("⚠ {}", error_msg);
+        let error_bar = Paragraph::new(error_text)
+            .style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            );
+        frame.render_widget(error_bar, area);
+    }
+}
+
 /// Render the footer
 fn render_footer(frame: &mut Frame, area: Rect) {
-    let footer = Paragraph::new("ESC: Back to Dashboard | q: Quit")
+    let footer = Paragraph::new("ESC: Back to Dashboard | r: Refresh | ?/h: Help | q: Quit")
         .style(Style::default().fg(Color::DarkGray));
 
     frame.render_widget(footer, area);

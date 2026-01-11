@@ -15,7 +15,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::stdout;
 use std::time::Duration;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 /// RAII guard to ensure terminal is properly restored on drop
 struct TerminalCleanup;
@@ -40,12 +40,13 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     let config = Config::load()?;
 
-    // Initialize app state
-    let mut app = App::new(config.clone());
-
     // Create channels for communication
     let (tx, mut rx) = mpsc::channel(100);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (force_refresh_tx, _) = broadcast::channel(16);
+
+    // Initialize app state with force refresh sender
+    let mut app = App::new(config.clone(), force_refresh_tx.clone());
 
     // Spawn health checker tasks
     let mut tasks = Vec::new();
@@ -54,7 +55,9 @@ async fn main() -> anyhow::Result<()> {
             site,
             tx.clone(),
             shutdown_rx.clone(),
+            force_refresh_tx.subscribe(),
             config.settings.request_timeout,
+            config.settings.refresh_interval,
         );
         tasks.push(handle);
     }
@@ -69,11 +72,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Main event loop
     loop {
+        // Check if error should be auto-dismissed
+        app.check_error_dismissal();
+
         // Render UI based on current view
         terminal.draw(|frame| {
             match &app.current_view {
                 View::Dashboard => ui::dashboard::render_dashboard(frame, &app),
                 View::Detail(site_name) => ui::detail::render_detail(frame, &app, site_name),
+                View::Help => ui::help::render_help(frame),
             }
         })?;
 

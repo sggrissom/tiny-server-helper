@@ -10,18 +10,38 @@ use ratatui::{
 
 /// Render the main dashboard view
 pub fn render_dashboard(frame: &mut Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    // Determine if we need an error bar
+    let has_error = app.error_message.is_some();
+
+    let constraints = if has_error {
+        vec![
+            Constraint::Length(3), // Header
+            Constraint::Min(0),    // Main content
+            Constraint::Length(1), // Error bar
+            Constraint::Length(1), // Footer
+        ]
+    } else {
+        vec![
             Constraint::Length(3), // Header
             Constraint::Min(0),    // Main content
             Constraint::Length(1), // Footer
-        ])
+        ]
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
         .split(frame.size());
 
     render_header(frame, app, chunks[0]);
     render_site_list(frame, app, chunks[1]);
-    render_footer(frame, chunks[2]);
+
+    if has_error {
+        render_error_bar(frame, app, chunks[2]);
+        render_footer(frame, chunks[3]);
+    } else {
+        render_footer(frame, chunks[2]);
+    }
 }
 
 /// Render the header with title and last update time
@@ -151,9 +171,24 @@ fn render_site_list(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(list, area);
 }
 
+/// Render the error status bar
+fn render_error_bar(frame: &mut Frame, app: &App, area: Rect) {
+    if let Some(error_msg) = &app.error_message {
+        let error_text = format!("⚠ {}", error_msg);
+        let error_bar = Paragraph::new(error_text)
+            .style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            );
+        frame.render_widget(error_bar, area);
+    }
+}
+
 /// Render the footer with keyboard shortcuts
 fn render_footer(frame: &mut Frame, area: Rect) {
-    let footer = Paragraph::new("↑↓: Navigate | Enter: Details | r: Refresh | q: Quit")
+    let footer = Paragraph::new("↑↓: Navigate | Enter: Details | r: Refresh | ?/h: Help | q: Quit")
         .style(Style::default().fg(Color::DarkGray));
 
     frame.render_widget(footer, area);
