@@ -14,3 +14,8 @@ request_timeout = 3         # HTTP request timeout in seconds
 name = "Resume Site"
 url = "https://steven.grissom.zone/healthz"
 expected_status = 200
+
+[[sites]]
+name = "Family Site"
+url = "https://grissom.zone/healthz"
+expected_status = 200

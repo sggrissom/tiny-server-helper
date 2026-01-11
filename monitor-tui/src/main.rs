@@ -1,34 +1,55 @@
+mod app;
 mod checker;
 mod config;
+mod history;
+mod ui;
 
-use checker::{spawn_checker_task, CheckResult, Status};
+use app::{App, AppAction};
+use checker::spawn_checker_task;
 use config::Config;
+use crossterm::{
+    event::{self, Event},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{backend::CrosstermBackend, Terminal};
+use std::io::stdout;
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
+/// RAII guard to ensure terminal is properly restored on drop
+struct TerminalCleanup;
+
+impl TerminalCleanup {
+    fn new() -> anyhow::Result<Self> {
+        enable_raw_mode()?;
+        execute!(stdout(), EnterAlternateScreen)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalCleanup {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout(), LeaveAlternateScreen);
+    }
+}
+
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     // Load configuration
-    let config = match Config::load() {
-        Ok(config) => {
-            println!("Configuration loaded successfully!\n");
-            config
-        }
-        Err(e) => {
-            eprintln!("Error loading configuration: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let config = Config::load()?;
 
-    println!("Starting health checks for {} sites...\n", config.sites.len());
+    // Initialize app state
+    let mut app = App::new(config.clone());
 
-    // Create channels
-    let (tx, mut rx) = mpsc::channel::<(String, CheckResult)>(100);
+    // Create channels for communication
+    let (tx, mut rx) = mpsc::channel(100);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Spawn checker tasks
+    // Spawn health checker tasks
     let mut tasks = Vec::new();
     for site in config.sites.clone() {
-        println!("Spawning checker for: {}", site.name);
         let handle = spawn_checker_task(
             site,
             tx.clone(),
@@ -41,45 +62,39 @@ async fn main() {
     // Drop original tx so channel closes when all tasks finish
     drop(tx);
 
-    println!("\nMonitoring... (Press Ctrl+C to stop)\n");
+    // Set up terminal
+    let _cleanup = TerminalCleanup::new()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    terminal.clear()?;
 
-    // Receive and log results
-    while let Some((site_name, result)) = rx.recv().await {
-        let status_str = match result.status {
-            Status::Up => "UP",
-            Status::Down => "DOWN",
-            Status::Warning => "WARN",
-        };
+    // Main event loop
+    loop {
+        // Render UI
+        terminal.draw(|frame| {
+            ui::dashboard::render_dashboard(frame, &app);
+        })?;
 
-        let time_str = result
-            .response_time_ms
-            .map(|ms| format!("{}ms", ms))
-            .unwrap_or_else(|| "--".to_string());
-
-        let http_str = result
-            .http_status
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "--".to_string());
-
-        print!("[{}] {:20} | Status: {:4} | Time: {:6} | HTTP: {}",
-            result.timestamp.format("%H:%M:%S"),
-            site_name,
-            status_str,
-            time_str,
-            http_str
-        );
-
-        if let Some(error) = result.error_message {
-            print!(" | Error: {}", error);
+        // Poll for keyboard events with timeout (~60 FPS)
+        if event::poll(Duration::from_millis(16))? {
+            if let Event::Key(key) = event::read()? {
+                match app.handle_key_event(key) {
+                    AppAction::Quit => break,
+                    AppAction::Continue => {}
+                }
+            }
         }
 
-        println!();
+        // Check for new health check results (non-blocking)
+        while let Ok((site_name, result)) = rx.try_recv() {
+            app.handle_check_result(site_name, result);
+        }
     }
 
     // Graceful shutdown
-    println!("\nShutting down...");
     let _ = shutdown_tx.send(true);
     for task in tasks {
         let _ = task.await;
     }
+
+    Ok(())
 }

@@ -1,0 +1,133 @@
+use crate::app::App;
+use crate::checker::Status;
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
+    Frame,
+};
+
+/// Render the main dashboard view
+pub fn render_dashboard(frame: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header
+            Constraint::Min(0),    // Main content
+            Constraint::Length(1), // Footer
+        ])
+        .split(frame.size());
+
+    render_header(frame, app, chunks[0]);
+    render_site_list(frame, app, chunks[1]);
+    render_footer(frame, chunks[2]);
+}
+
+/// Render the header with title and last update time
+fn render_header(frame: &mut Frame, app: &App, area: Rect) {
+    let last_update_str = app.last_update.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    let header_text = format!("Monitor TUI          Last Update: {}", last_update_str);
+
+    let header = Paragraph::new(header_text)
+        .block(Block::default().borders(Borders::ALL))
+        .style(Style::default().fg(Color::Cyan));
+
+    frame.render_widget(header, area);
+}
+
+/// Render the list of sites with their status
+fn render_site_list(frame: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = app
+        .sites
+        .iter()
+        .enumerate()
+        .map(|(idx, (site_name, history))| {
+            let latest = history.latest();
+
+            // Determine status color and text
+            let (status_color, status_text) = if let Some(result) = latest {
+                let color = match result.status {
+                    Status::Up => Color::Green,
+                    Status::Down => Color::Red,
+                    Status::Warning => Color::Yellow,
+                };
+                let text = match result.status {
+                    Status::Up => "UP  ",
+                    Status::Down => "DOWN",
+                    Status::Warning => "WARN",
+                };
+                (color, text)
+            } else {
+                (Color::Gray, "----")
+            };
+
+            // Get metrics
+            let response_time_str = latest
+                .and_then(|r| r.response_time_ms)
+                .map(|ms| format!("{}ms", ms))
+                .unwrap_or_else(|| "--".to_string());
+
+            let http_status_str = latest
+                .and_then(|r| r.http_status)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "--".to_string());
+
+            let uptime = if history.len() > 0 {
+                format!("{:.1}%", history.uptime_percentage())
+            } else {
+                "--".to_string()
+            };
+
+            // Get URL from config
+            let url = app
+                .config
+                .sites
+                .iter()
+                .find(|s| &s.name == site_name)
+                .map(|s| s.url.as_str())
+                .unwrap_or("");
+
+            // Build the display text
+            let line1 = Line::from(vec![
+                Span::styled("● ", Style::default().fg(status_color)),
+                Span::raw(format!("{:40}", site_name)),
+                Span::styled(
+                    format!("{:4}", status_text),
+                    Style::default().fg(status_color),
+                ),
+            ]);
+
+            let line2 = Line::from(format!("  {}", url));
+
+            let line3 = Line::from(format!(
+                "  Response: {:>6}  |  HTTP: {:>3}  |  Uptime: {:>5}",
+                response_time_str, http_status_str, uptime
+            ));
+
+            // Apply selection highlighting
+            let style = if idx == app.selected_index {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            ListItem::new(vec![line1, line2, line3]).style(style)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Sites"));
+
+    frame.render_widget(list, area);
+}
+
+/// Render the footer with keyboard shortcuts
+fn render_footer(frame: &mut Frame, area: Rect) {
+    let footer = Paragraph::new("↑↓: Navigate | Enter: Details | r: Refresh | q: Quit")
+        .style(Style::default().fg(Color::DarkGray));
+
+    frame.render_widget(footer, area);
+}
