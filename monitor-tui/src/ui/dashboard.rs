@@ -153,7 +153,7 @@ fn render_site_list(frame: &mut Frame, app: &App, area: Rect) {
             let line4 = Line::from(sparkline_str);
 
             // Apply selection highlighting
-            let style = if idx == app.selected_index {
+            let style = if app.selected_index == Some(idx) {
                 Style::default()
                     .bg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD)

@@ -24,7 +24,7 @@ pub enum View {
 pub struct App {
     pub config: Config,
     pub sites: IndexMap<String, SiteHistory>,
-    pub selected_index: usize,
+    pub selected_index: Option<usize>,
     pub last_update: DateTime<Utc>,
     pub current_view: View,
     pub error_message: Option<String>,
@@ -47,7 +47,7 @@ impl App {
         Self {
             config,
             sites,
-            selected_index: 0,
+            selected_index: None,
             last_update: Utc::now(),
             current_view: View::Dashboard,
             error_message: None,
@@ -73,12 +73,14 @@ impl App {
 
             // Help screen on '?' or 'h'
             KeyCode::Char('?') | KeyCode::Char('h') => {
+                self.selected_index = None;
                 self.current_view = View::Help;
                 AppAction::Continue
             }
 
             // ESC key - return to dashboard
             KeyCode::Esc => {
+                self.selected_index = None;
                 self.current_view = View::Dashboard;
                 AppAction::Continue
             }
@@ -86,8 +88,9 @@ impl App {
             // Enter key - open detail view for selected site
             KeyCode::Enter => {
                 if self.current_view == View::Dashboard {
-                    if let Some((name, _)) = self.selected_site() {
-                        self.current_view = View::Detail(name.clone());
+                    if let Some(name) = self.selected_site().map(|(name, _)| name.clone()) {
+                        self.selected_index = None;
+                        self.current_view = View::Detail(name);
                     }
                 }
                 AppAction::Continue
@@ -99,12 +102,11 @@ impl App {
                     if self.sites.is_empty() {
                         return AppAction::Continue;
                     }
-                    if self.selected_index > 0 {
-                        self.selected_index -= 1;
-                    } else {
-                        // Wrap around to bottom
-                        self.selected_index = self.sites.len() - 1;
-                    }
+                    self.selected_index = Some(match self.selected_index {
+                        None => 0,
+                        Some(idx) if idx > 0 => idx - 1,
+                        Some(_) => self.sites.len() - 1, // Wrap to bottom
+                    });
                 }
                 AppAction::Continue
             }
@@ -115,12 +117,11 @@ impl App {
                     if self.sites.is_empty() {
                         return AppAction::Continue;
                     }
-                    if self.selected_index < self.sites.len() - 1 {
-                        self.selected_index += 1;
-                    } else {
-                        // Wrap around to top
-                        self.selected_index = 0;
-                    }
+                    self.selected_index = Some(match self.selected_index {
+                        None => 0,
+                        Some(idx) if idx < self.sites.len() - 1 => idx + 1,
+                        Some(_) => 0, // Wrap to top
+                    });
                 }
                 AppAction::Continue
             }
@@ -139,7 +140,7 @@ impl App {
 
     /// Get the currently selected site
     pub fn selected_site(&self) -> Option<(&String, &SiteHistory)> {
-        self.sites.iter().nth(self.selected_index)
+        self.selected_index.and_then(|idx| self.sites.iter().nth(idx))
     }
 
     /// Set an error message (reserved for future use)

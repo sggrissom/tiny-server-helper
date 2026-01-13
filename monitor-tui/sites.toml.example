@@ -1,0 +1,36 @@
+# Monitor TUI Configuration Example
+# Copy this file to one of these locations:
+#   - ./sites.toml (current directory)
+#   - ~/.config/monitor/sites.toml
+#   - /etc/monitor/sites.toml
+
+[settings]
+# Global check interval in seconds (can be overridden per site)
+refresh_interval = 5
+
+# Number of historical data points to keep per site
+history_size = 100
+
+# HTTP request timeout in seconds
+request_timeout = 3
+
+# Example site configurations
+# Add as many [[sites]] sections as needed
+
+[[sites]]
+name = "Example Production API"
+url = "https://api.example.com/healthz"
+expected_status = 200
+# check_interval = 5  # Optional: override global interval
+
+[[sites]]
+name = "Example Website"
+url = "https://www.example.com/health"
+expected_status = 200
+check_interval = 10  # Check less frequently
+
+[[sites]]
+name = "Local Development"
+url = "http://localhost:3000/health"
+expected_status = 200
+check_interval = 2  # Check more frequently

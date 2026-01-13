@@ -19,3 +19,8 @@ expected_status = 200
 name = "Family Site"
 url = "https://grissom.zone/healthz"
 expected_status = 200
+
+[[sites]]
+name = "Releve Live"
+url = "https://releve.live/healthz"
+expected_status = 200
