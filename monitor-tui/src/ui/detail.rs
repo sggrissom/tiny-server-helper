@@ -330,7 +330,7 @@ fn render_error_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Render the footer
 fn render_footer(frame: &mut Frame, area: Rect) {
-    let footer = Paragraph::new("ESC: Back to Dashboard | r: Refresh | ?/h: Help | q: Quit")
+    let footer = Paragraph::new("ESC: Back to Dashboard | a: Alerts | r: Refresh | ?/h: Help | q: Quit")
         .style(Style::default().fg(Color::DarkGray));
 
     frame.render_widget(footer, area);

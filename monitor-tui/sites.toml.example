@@ -14,6 +14,35 @@ history_size = 100
 # HTTP request timeout in seconds
 request_timeout = 3
 
+# Alert configuration
+[settings.alerts]
+# Master switch for all alerts
+enabled = true
+
+# Ring terminal bell on alerts
+terminal_bell = true
+
+# Show desktop notifications
+desktop_notifications = true
+
+# Number of alerts to keep in history
+alert_history_size = 200
+
+# Number of consecutive failures before alerting (prevents false positives)
+consecutive_failures = 2
+
+# Cooldown period in seconds between repeat alerts for same site/status
+cooldown_seconds = 300  # 5 minutes
+
+# Which status transitions trigger alerts
+[settings.alerts.transitions]
+up_to_down = true       # Alert when site goes from UP to DOWN
+down_to_up = true       # Alert when site recovers (DOWN to UP)
+warn_to_down = true     # Alert when WARNING becomes DOWN
+warn_to_up = true       # Alert when WARNING recovers to UP
+up_to_warn = false      # Don't alert on warnings from healthy sites
+down_to_warn = false    # Don't alert on partial recovery
+
 # Example site configurations
 # Add as many [[sites]] sections as needed
 
@@ -22,6 +51,11 @@ name = "Example Production API"
 url = "https://api.example.com/healthz"
 expected_status = 200
 # check_interval = 5  # Optional: override global interval
+
+# Optional: Override alert settings for critical production service
+[sites.alerts]
+consecutive_failures = 1  # Alert immediately on first failure
+cooldown_seconds = 60     # Re-alert every minute
 
 [[sites]]
 name = "Example Website"

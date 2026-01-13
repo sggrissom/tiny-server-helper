@@ -188,7 +188,7 @@ fn render_error_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Render the footer with keyboard shortcuts
 fn render_footer(frame: &mut Frame, area: Rect) {
-    let footer = Paragraph::new("↑↓: Navigate | Enter: Details | r: Refresh | ?/h: Help | q: Quit")
+    let footer = Paragraph::new("↑↓: Navigate | Enter: Details | a: Alerts | r: Refresh | ?/h: Help | q: Quit")
         .style(Style::default().fg(Color::DarkGray));
 
     frame.render_widget(footer, area);

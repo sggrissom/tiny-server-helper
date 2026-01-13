@@ -9,6 +9,23 @@ refresh_interval = 5        # Seconds between checks
 history_size = 100          # Number of data points to keep per site
 request_timeout = 3         # HTTP request timeout in seconds
 
+# Alert configuration
+[settings.alerts]
+enabled = true
+terminal_bell = true
+desktop_notifications = true
+alert_history_size = 200
+consecutive_failures = 2
+cooldown_seconds = 300
+
+[settings.alerts.transitions]
+up_to_down = true
+down_to_up = true
+warn_to_down = true
+warn_to_up = true
+up_to_warn = true
+down_to_warn = false
+
 # Define your monitored sites below
 [[sites]]
 name = "Resume Site"

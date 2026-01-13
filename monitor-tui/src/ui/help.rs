@@ -69,6 +69,10 @@ fn render_help_content(frame: &mut Frame, area: Rect) {
             Span::styled("  ESC", Style::default().fg(Color::Green)),
             Span::raw("       Return to dashboard"),
         ]),
+        Line::from(vec![
+            Span::styled("  a", Style::default().fg(Color::Green)),
+            Span::raw("         View alert history"),
+        ]),
         Line::from(""),
         Line::from(vec![Span::styled(
             "Dashboard View",
@@ -106,6 +110,25 @@ fn render_help_content(frame: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled("  r", Style::default().fg(Color::Green)),
             Span::raw("         Force refresh all sites immediately"),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Alert History View",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![
+            Span::styled("  ↑  or  k", Style::default().fg(Color::Green)),
+            Span::raw("  Navigate up (previous alert)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  ↓  or  j", Style::default().fg(Color::Green)),
+            Span::raw("  Navigate down (next alert)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  ESC", Style::default().fg(Color::Green)),
+            Span::raw("       Return to dashboard"),
         ]),
         Line::from(""),
         Line::from(vec![Span::styled(

@@ -1,3 +1,4 @@
+use crate::alerts::{Alert, AlertDetector, AlertHistory};
 use crate::checker::CheckResult;
 use crate::config::Config;
 use crate::history::SiteHistory;
@@ -17,6 +18,7 @@ pub enum AppAction {
 pub enum View {
     Dashboard,
     Detail(String), // Detail view for a specific site (by name)
+    Alerts,         // Alert history view
     Help,           // Help screen showing keyboard shortcuts
 }
 
@@ -30,12 +32,16 @@ pub struct App {
     pub error_message: Option<String>,
     pub error_timestamp: Option<DateTime<Utc>>,
     force_refresh_tx: broadcast::Sender<()>,
+    pub alert_history: AlertHistory,
+    alert_detector: AlertDetector,
+    pub alert_selected_index: Option<usize>,
 }
 
 impl App {
     /// Create a new App with the given configuration
     pub fn new(config: Config, force_refresh_tx: broadcast::Sender<()>) -> Self {
         let history_size = config.settings.history_size;
+        let alert_history_size = config.settings.alerts.alert_history_size;
 
         // Initialize empty history for each site
         let sites: IndexMap<String, SiteHistory> = config
@@ -43,6 +49,9 @@ impl App {
             .iter()
             .map(|site| (site.name.clone(), SiteHistory::new(history_size)))
             .collect();
+
+        let alert_detector = AlertDetector::new(config.clone());
+        let alert_history = AlertHistory::new(alert_history_size);
 
         Self {
             config,
@@ -53,15 +62,44 @@ impl App {
             error_message: None,
             error_timestamp: None,
             force_refresh_tx,
+            alert_history,
+            alert_detector,
+            alert_selected_index: None,
         }
     }
 
     /// Handle a new check result
-    pub fn handle_check_result(&mut self, site_name: String, result: CheckResult) {
+    pub fn handle_check_result(&mut self, site_name: String, result: CheckResult) -> Option<Alert> {
+        // Get previous status from history (clone to avoid borrow conflicts)
+        let previous_status = self
+            .sites
+            .get(&site_name)
+            .and_then(|h| h.latest())
+            .map(|r| r.status.clone());
+
+        // Add result to history (existing logic)
         if let Some(history) = self.sites.get_mut(&site_name) {
-            history.add_result(result);
+            history.add_result(result.clone());
             self.last_update = Utc::now();
         }
+
+        // Check if this should trigger an alert
+        if let Some(transition) = self.alert_detector.evaluate(
+            &site_name,
+            previous_status.as_ref(),
+            &result.status,
+        ) {
+            let alert = Alert::new(
+                site_name,
+                transition,
+                previous_status.unwrap_or(crate::checker::Status::Up),
+                result.status,
+            );
+            self.alert_history.add_alert(alert.clone());
+            return Some(alert);
+        }
+
+        None
     }
 
     /// Handle keyboard input
@@ -78,9 +116,17 @@ impl App {
                 AppAction::Continue
             }
 
+            // Alert history on 'a'
+            KeyCode::Char('a') => {
+                self.alert_selected_index = None;
+                self.current_view = View::Alerts;
+                AppAction::Continue
+            }
+
             // ESC key - return to dashboard
             KeyCode::Esc => {
                 self.selected_index = None;
+                self.alert_selected_index = None;
                 self.current_view = View::Dashboard;
                 AppAction::Continue
             }
@@ -96,32 +142,58 @@ impl App {
                 AppAction::Continue
             }
 
-            // Navigate up (only in dashboard view)
+            // Navigate up
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.current_view == View::Dashboard {
-                    if self.sites.is_empty() {
-                        return AppAction::Continue;
+                match self.current_view {
+                    View::Dashboard => {
+                        if self.sites.is_empty() {
+                            return AppAction::Continue;
+                        }
+                        self.selected_index = Some(match self.selected_index {
+                            None => 0,
+                            Some(idx) if idx > 0 => idx - 1,
+                            Some(_) => self.sites.len() - 1, // Wrap to bottom
+                        });
                     }
-                    self.selected_index = Some(match self.selected_index {
-                        None => 0,
-                        Some(idx) if idx > 0 => idx - 1,
-                        Some(_) => self.sites.len() - 1, // Wrap to bottom
-                    });
+                    View::Alerts => {
+                        if self.alert_history.is_empty() {
+                            return AppAction::Continue;
+                        }
+                        self.alert_selected_index = Some(match self.alert_selected_index {
+                            None => 0,
+                            Some(idx) if idx > 0 => idx - 1,
+                            Some(_) => self.alert_history.len() - 1, // Wrap to bottom
+                        });
+                    }
+                    _ => {}
                 }
                 AppAction::Continue
             }
 
-            // Navigate down (only in dashboard view)
+            // Navigate down
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.current_view == View::Dashboard {
-                    if self.sites.is_empty() {
-                        return AppAction::Continue;
+                match self.current_view {
+                    View::Dashboard => {
+                        if self.sites.is_empty() {
+                            return AppAction::Continue;
+                        }
+                        self.selected_index = Some(match self.selected_index {
+                            None => 0,
+                            Some(idx) if idx < self.sites.len() - 1 => idx + 1,
+                            Some(_) => 0, // Wrap to top
+                        });
                     }
-                    self.selected_index = Some(match self.selected_index {
-                        None => 0,
-                        Some(idx) if idx < self.sites.len() - 1 => idx + 1,
-                        Some(_) => 0, // Wrap to top
-                    });
+                    View::Alerts => {
+                        if self.alert_history.is_empty() {
+                            return AppAction::Continue;
+                        }
+                        self.alert_selected_index = Some(match self.alert_selected_index {
+                            None => 0,
+                            Some(idx) if idx < self.alert_history.len() - 1 => idx + 1,
+                            Some(_) => 0, // Wrap to top
+                        });
+                    }
+                    _ => {}
                 }
                 AppAction::Continue
             }

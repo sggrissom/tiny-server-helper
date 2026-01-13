@@ -1,9 +1,11 @@
+mod alerts;
 mod app;
 mod checker;
 mod config;
 mod history;
 mod ui;
 
+use alerts::AlertNotifier;
 use app::{App, AppAction, View};
 use checker::spawn_checker_task;
 use config::Config;
@@ -48,6 +50,9 @@ async fn main() -> anyhow::Result<()> {
     // Initialize app state with force refresh sender
     let mut app = App::new(config.clone(), force_refresh_tx.clone());
 
+    // Create alert notifier
+    let alert_notifier = AlertNotifier::new(config.clone());
+
     // Spawn health checker tasks
     let mut tasks = Vec::new();
     for site in config.sites.clone() {
@@ -80,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
             match &app.current_view {
                 View::Dashboard => ui::dashboard::render_dashboard(frame, &app),
                 View::Detail(site_name) => ui::detail::render_detail(frame, &app, site_name),
+                View::Alerts => ui::alerts::render_alerts(frame, &app),
                 View::Help => ui::help::render_help(frame),
             }
         })?;
@@ -96,7 +102,14 @@ async fn main() -> anyhow::Result<()> {
 
         // Check for new health check results (non-blocking)
         while let Ok((site_name, result)) = rx.try_recv() {
-            app.handle_check_result(site_name, result);
+            if let Some(alert) = app.handle_check_result(site_name, result) {
+                // Spawn async notification task (non-blocking)
+                let notifier = alert_notifier.clone();
+                let alert_clone = alert.clone();
+                tokio::spawn(async move {
+                    notifier.notify(&alert_clone).await;
+                });
+            }
         }
     }
 
