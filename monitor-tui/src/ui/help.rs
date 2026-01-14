@@ -127,8 +127,23 @@ fn render_help_content(frame: &mut Frame, area: Rect) {
             Span::raw("  Navigate down (next alert)"),
         ]),
         Line::from(vec![
+            Span::styled("  Enter", Style::default().fg(Color::Green)),
+            Span::raw("     View details for selected alert"),
+        ]),
+        Line::from(vec![
             Span::styled("  ESC", Style::default().fg(Color::Green)),
             Span::raw("       Return to dashboard"),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Alert Detail View",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![
+            Span::styled("  ESC", Style::default().fg(Color::Green)),
+            Span::raw("       Return to alert history"),
         ]),
         Line::from(""),
         Line::from(vec![Span::styled(

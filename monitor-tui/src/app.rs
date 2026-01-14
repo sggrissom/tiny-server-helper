@@ -17,9 +17,10 @@ pub enum AppAction {
 #[derive(Debug, Clone, PartialEq)]
 pub enum View {
     Dashboard,
-    Detail(String), // Detail view for a specific site (by name)
-    Alerts,         // Alert history view
-    Help,           // Help screen showing keyboard shortcuts
+    Detail(String),      // Detail view for a specific site (by name)
+    Alerts,              // Alert history view
+    AlertDetail(usize),  // Alert detail view by index
+    Help,                // Help screen showing keyboard shortcuts
 }
 
 /// Main application state
@@ -123,21 +124,38 @@ impl App {
                 AppAction::Continue
             }
 
-            // ESC key - return to dashboard
+            // ESC key - return to previous view
             KeyCode::Esc => {
-                self.selected_index = None;
-                self.alert_selected_index = None;
-                self.current_view = View::Dashboard;
+                match self.current_view {
+                    View::AlertDetail(_) => {
+                        // Return to alerts list
+                        self.current_view = View::Alerts;
+                    }
+                    _ => {
+                        // Return to dashboard
+                        self.selected_index = None;
+                        self.alert_selected_index = None;
+                        self.current_view = View::Dashboard;
+                    }
+                }
                 AppAction::Continue
             }
 
-            // Enter key - open detail view for selected site
+            // Enter key - open detail view for selected site or alert
             KeyCode::Enter => {
-                if self.current_view == View::Dashboard {
-                    if let Some(name) = self.selected_site().map(|(name, _)| name.clone()) {
-                        self.selected_index = None;
-                        self.current_view = View::Detail(name);
+                match self.current_view {
+                    View::Dashboard => {
+                        if let Some(name) = self.selected_site().map(|(name, _)| name.clone()) {
+                            self.selected_index = None;
+                            self.current_view = View::Detail(name);
+                        }
                     }
+                    View::Alerts => {
+                        if let Some(index) = self.alert_selected_index {
+                            self.current_view = View::AlertDetail(index);
+                        }
+                    }
+                    _ => {}
                 }
                 AppAction::Continue
             }

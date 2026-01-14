@@ -86,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
                 View::Dashboard => ui::dashboard::render_dashboard(frame, &app),
                 View::Detail(site_name) => ui::detail::render_detail(frame, &app, site_name),
                 View::Alerts => ui::alerts::render_alerts(frame, &app),
+                View::AlertDetail(index) => ui::alert_detail::render_alert_detail(frame, &app, *index),
                 View::Help => ui::help::render_help(frame),
             }
         })?;
