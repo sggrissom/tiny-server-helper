@@ -10,7 +10,7 @@ use app::{App, AppAction, View};
 use checker::spawn_checker_task;
 use config::Config;
 use crossterm::{
-    event::{self, Event},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -25,7 +25,7 @@ struct TerminalCleanup;
 impl TerminalCleanup {
     fn new() -> anyhow::Result<Self> {
         enable_raw_mode()?;
-        execute!(stdout(), EnterAlternateScreen)?;
+        execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         Ok(Self)
     }
 }
@@ -33,7 +33,7 @@ impl TerminalCleanup {
 impl Drop for TerminalCleanup {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen);
+        let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
@@ -75,6 +75,9 @@ async fn main() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     terminal.clear()?;
 
+    // Track frame size for mouse click calculations
+    let mut last_frame_size = terminal.size()?;
+
     // Main event loop
     loop {
         // Check if error should be auto-dismissed
@@ -82,22 +85,29 @@ async fn main() -> anyhow::Result<()> {
 
         // Render UI based on current view
         terminal.draw(|frame| {
+            last_frame_size = frame.size();
             match &app.current_view {
                 View::Dashboard => ui::dashboard::render_dashboard(frame, &app),
                 View::Detail(site_name) => ui::detail::render_detail(frame, &app, site_name),
                 View::Alerts => ui::alerts::render_alerts(frame, &app),
                 View::AlertDetail(index) => ui::alert_detail::render_alert_detail(frame, &app, *index),
-                View::Help => ui::help::render_help(frame),
+                View::Help => ui::help::render_help(frame, &app),
             }
         })?;
 
-        // Poll for keyboard events with timeout (~60 FPS)
+        // Poll for events with timeout (~60 FPS)
         if event::poll(Duration::from_millis(16))? {
-            if let Event::Key(key) = event::read()? {
-                match app.handle_key_event(key) {
-                    AppAction::Quit => break,
-                    AppAction::Continue => {}
+            match event::read()? {
+                Event::Key(key) => {
+                    match app.handle_key_event(key) {
+                        AppAction::Quit => break,
+                        AppAction::Continue => {}
+                    }
                 }
+                Event::Mouse(mouse) => {
+                    app.handle_mouse_event(mouse, last_frame_size);
+                }
+                _ => {}
             }
         }
 

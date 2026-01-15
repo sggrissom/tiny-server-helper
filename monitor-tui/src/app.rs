@@ -1,10 +1,12 @@
 use crate::alerts::{Alert, AlertDetector, AlertHistory};
-use crate::checker::CheckResult;
+use crate::checker::{CheckResult, Status};
 use crate::config::Config;
 use crate::history::SiteHistory;
+use crate::ui::theme::{ResponsiveLayout, Theme, ThemeName};
 use chrono::{DateTime, Utc};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use indexmap::IndexMap;
+use ratatui::layout::Rect;
 use tokio::sync::broadcast;
 
 /// Actions that can result from handling events
@@ -26,6 +28,8 @@ pub enum View {
 /// Main application state
 pub struct App {
     pub config: Config,
+    pub theme: Theme,
+    pub theme_name: ThemeName,
     pub sites: IndexMap<String, SiteHistory>,
     pub selected_index: Option<usize>,
     pub last_update: DateTime<Utc>,
@@ -43,6 +47,8 @@ impl App {
     pub fn new(config: Config, force_refresh_tx: broadcast::Sender<()>) -> Self {
         let history_size = config.settings.history_size;
         let alert_history_size = config.settings.alerts.alert_history_size;
+        let theme_name = config.settings.theme;
+        let theme = Theme::from_name(theme_name);
 
         // Initialize empty history for each site
         let sites: IndexMap<String, SiteHistory> = config
@@ -56,6 +62,8 @@ impl App {
 
         Self {
             config,
+            theme,
+            theme_name,
             sites,
             selected_index: None,
             last_update: Utc::now(),
@@ -224,8 +232,20 @@ impl App {
                 AppAction::Continue
             }
 
+            // Cycle through themes
+            KeyCode::Char('t') => {
+                self.cycle_theme();
+                AppAction::Continue
+            }
+
             _ => AppAction::Continue,
         }
+    }
+
+    /// Cycle to the next theme
+    pub fn cycle_theme(&mut self) {
+        self.theme_name = self.theme_name.next();
+        self.theme = Theme::from_name(self.theme_name);
     }
 
     /// Get the currently selected site
@@ -254,6 +274,90 @@ impl App {
             if elapsed.num_seconds() >= 5 {
                 self.clear_error();
             }
+        }
+    }
+
+    /// Get counts of sites by status
+    pub fn status_counts(&self) -> (usize, usize, usize, usize) {
+        let mut up = 0;
+        let mut down = 0;
+        let mut warn = 0;
+        let mut unknown = 0;
+
+        for history in self.sites.values() {
+            match history.latest().map(|r| &r.status) {
+                Some(Status::Up) => up += 1,
+                Some(Status::Down) => down += 1,
+                Some(Status::Warning) => warn += 1,
+                None => unknown += 1,
+            }
+        }
+
+        (up, down, warn, unknown)
+    }
+
+    /// Handle mouse input
+    pub fn handle_mouse_event(&mut self, mouse: MouseEvent, frame_size: Rect) {
+        // Only handle left click down events
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return;
+        }
+
+        let row = mouse.row;
+        let col = mouse.column;
+
+        match self.current_view {
+            View::Dashboard => {
+                self.handle_dashboard_click(row, col, frame_size);
+            }
+            View::Alerts => {
+                self.handle_alerts_click(row, col, frame_size);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_dashboard_click(&mut self, row: u16, _col: u16, frame_size: Rect) {
+        // Layout: Header(3) + Content(variable) + StatusBar(1) + optional Error(1) + Footer(1)
+        let header_height = 3;
+        let footer_height = if self.error_message.is_some() { 3 } else { 2 }; // status + footer + optional error
+        let content_start = header_height;
+        let content_end = frame_size.height.saturating_sub(footer_height);
+
+        // Check if click is in the content area
+        if row < content_start || row >= content_end {
+            return;
+        }
+
+        // Calculate item index based on click position
+        let responsive = ResponsiveLayout::new(frame_size.width);
+        let lines_per_item = responsive.lines_per_site_item();
+        let content_row = row - content_start - 1; // -1 for top border
+        let clicked_index = (content_row / lines_per_item) as usize;
+
+        if clicked_index < self.sites.len() {
+            self.selected_index = Some(clicked_index);
+        }
+    }
+
+    fn handle_alerts_click(&mut self, row: u16, _col: u16, frame_size: Rect) {
+        // Layout: Header(3) + Alert list(variable) + Summary(3) + StatusBar(1) + Footer(1)
+        let header_height = 3;
+        let footer_height = 5; // summary(3) + status(1) + footer(1)
+        let content_start = header_height;
+        let content_end = frame_size.height.saturating_sub(footer_height);
+
+        if row < content_start || row >= content_end {
+            return;
+        }
+
+        // Each alert takes 2 lines
+        let lines_per_item = 2;
+        let content_row = row - content_start - 1;
+        let clicked_index = (content_row / lines_per_item) as usize;
+
+        if clicked_index < self.alert_history.len() {
+            self.alert_selected_index = Some(clicked_index);
         }
     }
 }

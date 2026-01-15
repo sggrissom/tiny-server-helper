@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 
+use crate::ui::theme::ThemeName;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub settings: Settings,
@@ -16,6 +18,8 @@ pub struct Settings {
     pub history_size: usize,
     #[serde(default = "default_request_timeout")]
     pub request_timeout: u64,
+    #[serde(default)]
+    pub theme: ThemeName,
     #[serde(default)]
     pub alerts: AlertSettings,
 }

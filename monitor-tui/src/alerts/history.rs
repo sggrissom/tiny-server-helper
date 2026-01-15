@@ -25,6 +25,7 @@ impl AlertSeverity {
 pub struct Alert {
     pub timestamp: DateTime<Utc>,
     pub site_name: String,
+    #[allow(dead_code)]
     pub transition: StatusTransition,
     pub severity: AlertSeverity,
     pub current_status: Status,
@@ -98,6 +99,7 @@ impl AlertHistory {
         self.alerts.push_back(alert);
     }
 
+    #[allow(dead_code)]
     pub fn latest(&self) -> Option<&Alert> {
         self.alerts.back()
     }

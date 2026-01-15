@@ -8,6 +8,7 @@
 refresh_interval = 5        # Seconds between checks
 history_size = 100          # Number of data points to keep per site
 request_timeout = 3         # HTTP request timeout in seconds
+theme = "high-contrast"
 
 # Alert configuration
 [settings.alerts]
