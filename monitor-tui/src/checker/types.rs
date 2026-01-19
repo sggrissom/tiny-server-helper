@@ -27,11 +27,21 @@ impl CheckResult {
         }
     }
 
-    pub fn new_success(response_time_ms: u64, http_status: u16, expected_status: u16) -> Self {
-        let status = if http_status == expected_status {
-            Status::Up
-        } else {
+    pub fn new_success(
+        response_time_ms: u64,
+        http_status: u16,
+        expected_status: u16,
+        warning_threshold_ms: Option<u64>,
+    ) -> Self {
+        let status_mismatch = http_status != expected_status;
+        let slow_response = warning_threshold_ms
+            .filter(|&t| t > 0)
+            .is_some_and(|t| response_time_ms > t);
+
+        let status = if status_mismatch || slow_response {
             Status::Warning
+        } else {
+            Status::Up
         };
 
         Self {

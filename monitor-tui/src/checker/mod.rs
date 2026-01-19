@@ -15,14 +15,18 @@ pub fn spawn_checker_task(
     mut force_refresh: broadcast::Receiver<()>,
     timeout_secs: u64,
     default_interval: u64,
+    global_warning_threshold_ms: Option<u64>,
 ) -> tokio::task::JoinHandle<()> {
+    // Resolve: site override takes precedence over global setting
+    let warning_threshold_ms = site.warning_threshold_ms.or(global_warning_threshold_ms);
+
     tokio::spawn(async move {
         let checker = HttpChecker::new(timeout_secs);
         let interval = Duration::from_secs(site.check_interval.unwrap_or(default_interval));
 
         loop {
             // Perform check
-            let result = checker.check(&site).await;
+            let result = checker.check(&site, warning_threshold_ms).await;
 
             // Send result (ignore if channel closed)
             let _ = tx.send((site.name.clone(), result)).await;

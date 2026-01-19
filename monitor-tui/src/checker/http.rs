@@ -18,7 +18,7 @@ impl HttpChecker {
         Self { client }
     }
 
-    pub async fn check(&self, site: &SiteConfig) -> CheckResult {
+    pub async fn check(&self, site: &SiteConfig, warning_threshold_ms: Option<u64>) -> CheckResult {
         let start = Instant::now();
 
         match self.client.get(&site.url).send().await {
@@ -30,6 +30,7 @@ impl HttpChecker {
                     elapsed.as_millis() as u64,
                     status_code,
                     site.expected_status,
+                    warning_threshold_ms,
                 )
             }
             Err(e) => {

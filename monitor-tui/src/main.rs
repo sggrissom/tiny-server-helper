@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
             force_refresh_tx.subscribe(),
             config.settings.request_timeout,
             config.settings.refresh_interval,
+            config.settings.warning_threshold_ms,
         );
         tasks.push(handle);
     }

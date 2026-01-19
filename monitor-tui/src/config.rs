@@ -22,6 +22,8 @@ pub struct Settings {
     pub theme: ThemeName,
     #[serde(default)]
     pub alerts: AlertSettings,
+    #[serde(default)]
+    pub warning_threshold_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -32,6 +34,8 @@ pub struct SiteConfig {
     pub check_interval: Option<u64>,
     #[serde(default)]
     pub alerts: Option<SiteAlertSettings>,
+    #[serde(default)]
+    pub warning_threshold_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
