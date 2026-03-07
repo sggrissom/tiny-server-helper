@@ -4,16 +4,20 @@ set -euo pipefail
 usage() {
   cat <<EOF
 Usage:
-  deploy <app_name> <user@host> <local_binary_path>
+  deploy <app_name> <user@host> <local_binary_path> [service_type]
+
+service_type defaults to "app" (uses app@<name>.service).
+Use "internal" for internal-only services (uses internal@<name>.service).
 
 Examples:
   deploy resume vps ./build/resume
+  deploy family-face vps ./build/family-face internal
 EOF
 }
 
 die(){ echo "Error: $*" >&2; exit 1; }
 
-app="${1:-}"; host="${2:-}"; binpath="${3:-}"
+app="${1:-}"; host="${2:-}"; binpath="${3:-}"; svctype="${4:-app}"
 [[ -n "$app" && -n "$host" && -n "$binpath" ]] || { usage; exit 1; }
 [[ -f "$binpath" ]] || die "binary not found: $binpath"
 
@@ -49,7 +53,7 @@ ssh "$host" "sudo mv '$tmp' '$remote_bin' && sudo chmod +x '$remote_bin'"
 # Activate release + restart
 ssh "$host" "
   sudo ln -sfn '$remote_rel' '$remote_root/current' &&
-  sudo systemctl restart 'app@$app'
+  sudo systemctl restart '${svctype}@$app'
 "
 
 echo "Waiting for health…"
@@ -77,7 +81,7 @@ ssh "$host" "
 
 echo "✅ Done."
 echo "Logs:"
-echo "  ssh $host 'journalctl -u app@$app -f'"
+echo "  ssh $host 'journalctl -u ${svctype}@$app -f'"
 echo "Current:"
 echo "  ssh $host 'readlink -f $remote_root/current'"
 

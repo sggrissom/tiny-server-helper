@@ -1,0 +1,22 @@
+[Unit]
+Description=Internal Service (%i)
+After=network.target
+
+[Service]
+Type=simple
+User=apps
+Group=apps
+WorkingDirectory=/srv/apps/%i/current
+EnvironmentFile=/srv/apps/%i/shared/.env
+RuntimeDirectory=%i
+RuntimeDirectoryMode=0750
+
+ExecStart=/srv/apps/%i/current/%i
+
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -27,10 +27,12 @@ sudo mkdir -p /etc/caddy/sites
 sudo chown -R "$APPS_USER:$APPS_USER" "$APPS_ROOT"
 sudo chmod 0755 "$APPS_ROOT"
 
-# 3) Install systemd template
+# 3) Install systemd templates
 [[ -f systemd/app@.service ]] || { echo "Run from repo root (missing systemd/app@.service)"; exit 1; }
 echo "Installing systemd unit: /etc/systemd/system/app@.service"
 sudo cp systemd/app@.service /etc/systemd/system/app@.service
+echo "Installing systemd unit: /etc/systemd/system/internal@.service"
+sudo cp systemd/internal@.service /etc/systemd/system/internal@.service
 sudo systemctl daemon-reload
 
 # 4) Ensure Caddy imports sites folder (append if missing)
