@@ -42,3 +42,8 @@ expected_status = 200
 name = "Releve Live"
 url = "https://releve.live/healthz"
 expected_status = 200
+
+[[sites]]
+name = "Chess Stats"
+url = "https://chess.grissom.zone/healthz"
+expected_status = 200

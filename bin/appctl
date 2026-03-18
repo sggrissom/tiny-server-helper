@@ -40,7 +40,7 @@ case "$cmd" in
     current="$root/current"
 
     echo "Creating directories for $app..."
-    mkdir -p "$rel" "$shared"
+    mkdir -p "$rel" "$shared" "$shared/data"
     chown -R apps:apps "/srv/apps/$app"
 
     # Create env file if it doesn't exist
@@ -62,6 +62,7 @@ EOF
     echo "  $root/"
     echo "    releases/"
     echo "    shared/.env"
+    echo "    shared/data/"
 
     echo "Next: deploy a binary (creates current symlink automatically)."
     echo "To start: sudo systemctl enable --now app@$app"
