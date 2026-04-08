@@ -87,8 +87,14 @@ pub fn spawn_metrics_task(
 
         let interval = Duration::from_secs(config.poll_interval);
 
+        let api_key = std::env::var("METRICS_API_KEY").ok();
+
         loop {
-            let result = match client.get(&config.url).send().await {
+            let mut req = client.get(&config.url);
+            if let Some(key) = &api_key {
+                req = req.header("Authorization", format!("Bearer {}", key));
+            }
+            let result = match req.send().await {
                 Ok(resp) => match resp.json::<MetricsSnapshot>().await {
                     Ok(snapshot) => MetricsPoll::Ok(snapshot),
                     Err(e) => MetricsPoll::Error(format!("Failed to parse metrics: {}", e)),

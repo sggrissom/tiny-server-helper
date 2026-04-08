@@ -3,24 +3,44 @@ mod log_reader;
 mod metrics;
 mod system;
 
-use axum::{Json, Router, extract::State, response::IntoResponse, routing::get};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::get,
+};
 use log_reader::LogReader;
 use metrics::{Config, MetricsSnapshot};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
 
-type SharedState = Arc<RwLock<MetricsSnapshot>>;
+#[derive(Clone)]
+struct AppState {
+    metrics: Arc<RwLock<MetricsSnapshot>>,
+    api_key: Option<String>,
+}
 
 async fn healthz() -> &'static str {
     "ok"
 }
 
-async fn get_metrics(State(state): State<SharedState>) -> impl IntoResponse {
-    Json(state.read().await.clone())
+async fn get_metrics(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Some(key) = &state.api_key {
+        let expected = format!("Bearer {}", key);
+        let provided = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if provided != expected {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
+    Json(state.metrics.read().await.clone()).into_response()
 }
 
-async fn run_collector(config: Arc<Config>, state: SharedState) {
+async fn run_collector(config: Arc<Config>, state: Arc<RwLock<MetricsSnapshot>>) {
     let mut prev_cpu = None;
     let mut log_reader = LogReader::new(&config.log_dir, config.metrics_window_seconds);
     loop {
@@ -51,9 +71,14 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(900),
     });
 
-    let state: SharedState = Arc::new(RwLock::new(MetricsSnapshot::default()));
+    let api_key = std::env::var("API_KEY").ok();
 
-    tokio::spawn(run_collector(config.clone(), state.clone()));
+    let state = AppState {
+        metrics: Arc::new(RwLock::new(MetricsSnapshot::default())),
+        api_key,
+    };
+
+    tokio::spawn(run_collector(config.clone(), state.metrics.clone()));
 
     let app = Router::new()
         .route("/healthz", get(healthz))
