@@ -163,11 +163,24 @@ EOF
     echo "  Domain: $domain"
     echo "  Port: $port"
 
+    # Ensure Caddy log directory exists
+    if [[ ! -d /var/log/caddy ]]; then
+      mkdir -p /var/log/caddy
+      chown caddy:caddy /var/log/caddy 2>/dev/null || true
+    fi
+
     # Create Caddy config (atomic write via temp file)
     temp_config=$(mktemp)
     cat >"$temp_config" <<EOF
 $domain {
     reverse_proxy localhost:$port
+    log {
+        output file /var/log/caddy/access-${app}.log {
+            roll_size 50mb
+            roll_keep 3
+        }
+        format json
+    }
 }
 EOF
 
@@ -198,6 +211,7 @@ EOF
     if systemctl reload caddy 2>&1; then
       echo "✅ Domain configured successfully"
       echo "   $domain → localhost:$port"
+      echo "   Access log: /var/log/caddy/access-${app}.log"
       echo ""
       echo "Next steps:"
       echo "  1. Ensure DNS points to this server"
