@@ -1,0 +1,3 @@
+[workspace]
+members = ["monitor-tui", "metrics-server"]
+resolver = "2"
