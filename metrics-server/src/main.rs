@@ -1,8 +1,10 @@
 mod apps;
+mod log_reader;
 mod metrics;
 mod system;
 
 use axum::{Json, Router, extract::State, response::IntoResponse, routing::get};
+use log_reader::LogReader;
 use metrics::{Config, MetricsSnapshot};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -20,8 +22,9 @@ async fn get_metrics(State(state): State<SharedState>) -> impl IntoResponse {
 
 async fn run_collector(config: Arc<Config>, state: SharedState) {
     let mut prev_cpu = None;
+    let mut log_reader = LogReader::new(&config.log_dir, config.metrics_window_seconds);
     loop {
-        let snapshot = metrics::collect(&config, &mut prev_cpu).await;
+        let snapshot = metrics::collect(&config, &mut prev_cpu, &mut log_reader).await;
         *state.write().await = snapshot;
         tokio::time::sleep(Duration::from_secs(config.collect_interval)).await;
     }

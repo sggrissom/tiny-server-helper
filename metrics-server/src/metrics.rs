@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::apps;
+use crate::log_reader::LogReader;
 use crate::system::{self, CpuSnapshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -86,7 +87,11 @@ pub struct Config {
     pub metrics_window_seconds: u64,
 }
 
-pub async fn collect(config: &Config, prev_cpu: &mut Option<CpuSnapshot>) -> MetricsSnapshot {
+pub async fn collect(
+    config: &Config,
+    prev_cpu: &mut Option<CpuSnapshot>,
+    log_reader: &mut LogReader,
+) -> MetricsSnapshot {
     let load_avg = system::read_load_avg().unwrap_or_default();
     let memory = system::read_memory().unwrap_or_default();
     let disk = system::read_disk().unwrap_or_default();
@@ -100,19 +105,18 @@ pub async fn collect(config: &Config, prev_cpu: &mut Option<CpuSnapshot>) -> Met
 
     let apps_dir = Path::new(&config.apps_dir);
     let app_names = apps::scan_apps(apps_dir);
+    let mut traffic_map = log_reader.update(&app_names);
+
     let app_metrics = app_names
         .into_iter()
         .map(|name| {
             let app_dir = apps_dir.join(&name);
             let disk_kb = apps::disk_usage_kb(&app_dir);
-            AppMetrics {
-                name,
-                disk_kb,
-                traffic: TrafficWindow {
-                    window_seconds: config.metrics_window_seconds,
-                    ..Default::default()
-                },
-            }
+            let traffic = traffic_map.remove(&name).unwrap_or(TrafficWindow {
+                window_seconds: config.metrics_window_seconds,
+                ..Default::default()
+            });
+            AppMetrics { name, disk_kb, traffic }
         })
         .collect();
 
