@@ -210,7 +210,7 @@ fn render_error_bar(frame: &mut Frame, app: &App, area: Rect) {
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
     let footer =
-        Paragraph::new(" ↑↓: Navigate | Enter: Details | a: Alerts | r: Refresh | ?/h: Help | q: Quit")
+        Paragraph::new(" ↑↓: Navigate | Enter: Details | a: Alerts | s: Server | r: Refresh | ?/h: Help | q: Quit")
             .style(Style::default().fg(theme.footer_fg));
 
     frame.render_widget(footer, area);

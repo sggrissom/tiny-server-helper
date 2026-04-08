@@ -75,6 +75,10 @@ fn render_help_content(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("         View alert history", Style::default().fg(theme.text_primary)),
         ]),
         Line::from(vec![
+            Span::styled("  s", Style::default().fg(theme.status_up)),
+            Span::styled("         View server metrics", Style::default().fg(theme.text_primary)),
+        ]),
+        Line::from(vec![
             Span::styled("  t", Style::default().fg(theme.status_up)),
             Span::styled("         Cycle theme (Dark/Light/High-Contrast)", Style::default().fg(theme.text_primary)),
         ]),
@@ -149,6 +153,29 @@ fn render_help_content(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled("  ESC", Style::default().fg(theme.status_up)),
             Span::styled("       Return to alert history", Style::default().fg(theme.text_primary)),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Server View",
+            Style::default()
+                .fg(theme.status_warning)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![
+            Span::styled("  s", Style::default().fg(theme.status_up)),
+            Span::styled("         Force refresh metrics immediately", Style::default().fg(theme.text_primary)),
+        ]),
+        Line::from(vec![
+            Span::styled("  ↑  or  k", Style::default().fg(theme.status_up)),
+            Span::styled("  Scroll apps up", Style::default().fg(theme.text_primary)),
+        ]),
+        Line::from(vec![
+            Span::styled("  ↓  or  j", Style::default().fg(theme.status_up)),
+            Span::styled("  Scroll apps down", Style::default().fg(theme.text_primary)),
+        ]),
+        Line::from(vec![
+            Span::styled("  ESC", Style::default().fg(theme.status_up)),
+            Span::styled("       Return to dashboard", Style::default().fg(theme.text_primary)),
         ]),
         Line::from(""),
         Line::from(vec![Span::styled(

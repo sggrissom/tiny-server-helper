@@ -24,6 +24,7 @@ pub enum View {
     Alerts,              // Alert history view
     AlertDetail(usize),  // Alert detail view by index
     Help,                // Help screen showing keyboard shortcuts
+    Server,              // Server metrics view
 }
 
 /// Main application state
@@ -212,6 +213,16 @@ impl App {
                             Some(_) => self.alert_history.len() - 1, // Wrap to bottom
                         });
                     }
+                    View::Server => {
+                        let count = self.server_metrics.as_ref().map(|s| s.apps.len()).unwrap_or(0);
+                        if count > 0 {
+                            self.server_selected_index = if self.server_selected_index > 0 {
+                                self.server_selected_index - 1
+                            } else {
+                                count - 1
+                            };
+                        }
+                    }
                     _ => {}
                 }
                 AppAction::Continue
@@ -240,6 +251,16 @@ impl App {
                             Some(_) => 0, // Wrap to top
                         });
                     }
+                    View::Server => {
+                        let count = self.server_metrics.as_ref().map(|s| s.apps.len()).unwrap_or(0);
+                        if count > 0 {
+                            self.server_selected_index = if self.server_selected_index < count - 1 {
+                                self.server_selected_index + 1
+                            } else {
+                                0
+                            };
+                        }
+                    }
                     _ => {}
                 }
                 AppAction::Continue
@@ -250,6 +271,17 @@ impl App {
                 // Send broadcast to all checker tasks
                 // Ignore errors (no receivers is fine)
                 let _ = self.force_refresh_tx.send(());
+                AppAction::Continue
+            }
+
+            // Server metrics view (or refresh if already in it)
+            KeyCode::Char('s') => {
+                if self.current_view == View::Server {
+                    let _ = self.force_refresh_tx.send(());
+                } else {
+                    self.server_selected_index = 0;
+                    self.current_view = View::Server;
+                }
                 AppAction::Continue
             }
 

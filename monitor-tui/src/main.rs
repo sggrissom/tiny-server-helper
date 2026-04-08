@@ -111,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
                 View::Alerts => ui::alerts::render_alerts(frame, &app),
                 View::AlertDetail(index) => ui::alert_detail::render_alert_detail(frame, &app, *index),
                 View::Help => ui::help::render_help(frame, &app),
+                View::Server => ui::server::render_server(frame, &app),
             }
         })?;
 

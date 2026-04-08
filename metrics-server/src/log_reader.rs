@@ -115,7 +115,7 @@ fn compute_traffic(entries: &VecDeque<(f64, u16)>, window_seconds: u64) -> Traff
     let error_4xx = entries.iter().filter(|(_, s)| *s >= 400 && *s < 500).count() as u64;
     let error_5xx = entries.iter().filter(|(_, s)| *s >= 500).count() as u64;
     let error_pct = if requests_total > 0 {
-        (error_4xx + error_5xx) as f64 / requests_total as f64 * 100.0
+        error_5xx as f64 / requests_total as f64 * 100.0
     } else {
         0.0
     };
