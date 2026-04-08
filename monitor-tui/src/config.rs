@@ -8,6 +8,8 @@ use crate::ui::theme::ThemeName;
 pub struct Config {
     pub settings: Settings,
     pub sites: Vec<SiteConfig>,
+    #[serde(default)]
+    pub server_metrics: Option<ServerMetricsConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -70,6 +72,13 @@ pub struct TransitionSettings {
     pub warn_to_up: bool,
     #[serde(default = "default_false")]
     pub down_to_warn: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerMetricsConfig {
+    pub url: String,
+    #[serde(default = "default_metrics_poll_interval")]
+    pub poll_interval: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,6 +148,10 @@ fn default_consecutive_failures() -> usize {
 
 fn default_cooldown_seconds() -> u64 {
     300
+}
+
+fn default_metrics_poll_interval() -> u64 {
+    30
 }
 
 impl Config {

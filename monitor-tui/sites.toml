@@ -27,6 +27,10 @@ warn_to_up = true
 up_to_warn = true
 down_to_warn = false
 
+[server_metrics]
+url = "https://metrics.grissom.zone/metrics"
+poll_interval = 30
+
 # Define your monitored sites below
 [[sites]]
 name = "Resume Site"

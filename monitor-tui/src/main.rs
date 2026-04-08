@@ -3,12 +3,14 @@ mod app;
 mod checker;
 mod config;
 mod history;
+mod metrics_poller;
 mod ui;
 
 use alerts::AlertNotifier;
 use app::{App, AppAction, View};
 use checker::spawn_checker_task;
 use config::Config;
+use metrics_poller::{spawn_metrics_task, MetricsPoll};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
@@ -68,6 +70,22 @@ async fn main() -> anyhow::Result<()> {
         tasks.push(handle);
     }
 
+    // Conditionally spawn metrics poller if configured
+    let mut metrics_rx: Option<mpsc::Receiver<MetricsPoll>> = None;
+    let mut metrics_task: Option<tokio::task::JoinHandle<()>> = None;
+
+    if let Some(metrics_config) = config.server_metrics.clone() {
+        let (metrics_tx, rx) = mpsc::channel(100);
+        let handle = spawn_metrics_task(
+            metrics_config,
+            metrics_tx,
+            shutdown_rx.clone(),
+            force_refresh_tx.subscribe(),
+        );
+        metrics_rx = Some(rx);
+        metrics_task = Some(handle);
+    }
+
     // Drop original tx so channel closes when all tasks finish
     drop(tx);
 
@@ -123,11 +141,21 @@ async fn main() -> anyhow::Result<()> {
                 });
             }
         }
+
+        // Drain metrics poll results (non-blocking)
+        if let Some(ref mut mrx) = metrics_rx {
+            while let Ok(poll) = mrx.try_recv() {
+                app.update_metrics(poll);
+            }
+        }
     }
 
     // Graceful shutdown
     let _ = shutdown_tx.send(true);
     for task in tasks {
+        let _ = task.await;
+    }
+    if let Some(task) = metrics_task {
         let _ = task.await;
     }
 

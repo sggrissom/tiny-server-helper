@@ -1,6 +1,7 @@
 use crate::alerts::{Alert, AlertDetector, AlertHistory};
 use crate::checker::{CheckResult, Status};
 use crate::config::Config;
+use crate::metrics_poller::{MetricsPoll, MetricsSnapshot};
 use crate::history::SiteHistory;
 use crate::ui::theme::{ResponsiveLayout, Theme, ThemeName};
 use chrono::{DateTime, Utc};
@@ -40,6 +41,9 @@ pub struct App {
     pub alert_history: AlertHistory,
     alert_detector: AlertDetector,
     pub alert_selected_index: Option<usize>,
+    pub server_metrics: Option<MetricsSnapshot>,
+    pub server_metrics_error: Option<String>,
+    pub server_selected_index: usize,
 }
 
 impl App {
@@ -74,6 +78,9 @@ impl App {
             alert_history,
             alert_detector,
             alert_selected_index: None,
+            server_metrics: None,
+            server_metrics_error: None,
+            server_selected_index: 0,
         }
     }
 
@@ -109,6 +116,20 @@ impl App {
         }
 
         None
+    }
+
+    /// Handle a metrics poll result
+    pub fn update_metrics(&mut self, result: MetricsPoll) {
+        match result {
+            MetricsPoll::Ok(snapshot) => {
+                self.server_metrics = Some(snapshot);
+                self.server_metrics_error = None;
+            }
+            MetricsPoll::Error(msg) => {
+                self.server_metrics_error = Some(msg);
+                // preserve last-known-good server_metrics for stale display in Phase 5
+            }
+        }
     }
 
     /// Handle keyboard input
