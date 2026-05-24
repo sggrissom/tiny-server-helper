@@ -86,8 +86,9 @@ EOF
         release="(not initialized)"
       fi
 
-      # Get systemd status
-      if systemctl is-active --quiet "app@$app" 2>/dev/null; then
+      # Get systemd status (check both app@ and internal@ service types)
+      if systemctl is-active --quiet "app@$app" 2>/dev/null || \
+         systemctl is-active --quiet "internal@$app" 2>/dev/null; then
         status="running"
       else
         status="stopped"
