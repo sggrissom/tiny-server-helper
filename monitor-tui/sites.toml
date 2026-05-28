@@ -34,7 +34,7 @@ poll_interval = 30
 # Define your monitored sites below
 [[sites]]
 name = "Resume Site"
-url = "https://steven.grissom.zone/healthz"
+url = "https://stevengrissom.com/healthz"
 expected_status = 200
 
 [[sites]]
@@ -50,4 +50,9 @@ expected_status = 200
 [[sites]]
 name = "Chess Stats"
 url = "https://chess.grissom.zone/healthz"
+expected_status = 200
+
+[[sites]]
+name = "Karaoke Maker"
+url = "https://karaoke.grissom.zone/healthz"
 expected_status = 200
