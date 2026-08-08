@@ -40,7 +40,13 @@ KEYTABLE="$DKIM_DIR/KeyTable"
 SIGNINGTABLE="$DKIM_DIR/SigningTable"
 TRUSTEDHOSTS="$DKIM_DIR/TrustedHosts"
 MILTER_PORT="8891"
+# The same socket, spelled two different ways on purpose. Postfix's
+# smtpd_milters takes inet:host:port; OpenDKIM's Socket takes inet:port@host.
+# Using one form for both leaves OpenDKIM listening somewhere Postfix never
+# looks, and with milter_default_action=tempfail every send then fails with
+# "451 4.7.1 Service unavailable".
 MILTER="inet:127.0.0.1:$MILTER_PORT"
+DKIM_SOCKET="inet:$MILTER_PORT@127.0.0.1"
 
 # ---------------------------------------------------------------------------
 # check output helpers
@@ -602,6 +608,12 @@ case "$cmd" in
     # --- Postfix ----------------------------------------------------------
     # postconf -e is idempotent by construction: it rewrites the line if
     # present and appends it if not, so re-running setup is a no-op.
+    #
+    # Note smtpd_tls_security_level = none below. Debian ships `may` with a
+    # snakeoil cert, so Postfix would advertise STARTTLS on loopback and any
+    # client that auto-upgrades (Go's net/smtp does) fails certificate
+    # validation against 127.0.0.1. Nothing external can reach this listener,
+    # so TLS on it buys nothing and costs every app a confusing error.
     echo "Configuring Postfix..."
     postconf -e \
       "myhostname = $host" \
@@ -619,6 +631,7 @@ case "$cmd" in
       "smtpd_client_restrictions = permit_mynetworks, reject" \
       "smtpd_helo_required = yes" \
       "disable_vrfy_command = yes" \
+      "smtpd_tls_security_level = none" \
       "smtp_tls_security_level = may" \
       "smtp_tls_note_starttls_offer = yes" \
       "smtp_tls_loglevel = 1" \
@@ -666,7 +679,7 @@ Mode                    s
 # A loopback TCP socket avoids the whole chroot/permissions class of bugs that
 # comes with a unix socket under /var/spool/postfix. It grants no capability
 # that 127.0.0.1:25 does not already grant to the same local users.
-Socket                  $MILTER
+Socket                  $DKIM_SOCKET
 
 Canonicalization        relaxed/simple
 SignatureAlgorithm      rsa-sha256
@@ -702,9 +715,9 @@ EOF
     # which can silently contradict opendkim.conf. Keep the two in agreement.
     if [[ -f /etc/default/opendkim ]]; then
       if grep -qE '^\s*#?\s*SOCKET=' /etc/default/opendkim; then
-        sed -i "s|^\s*#\?\s*SOCKET=.*|SOCKET=\"inet:$MILTER_PORT@localhost\"|" /etc/default/opendkim
+        sed -i "s|^\s*#\?\s*SOCKET=.*|SOCKET=\"$DKIM_SOCKET\"|" /etc/default/opendkim
       else
-        echo "SOCKET=\"inet:$MILTER_PORT@localhost\"" >>/etc/default/opendkim
+        echo "SOCKET=\"$DKIM_SOCKET\"" >>/etc/default/opendkim
       fi
       [[ -x /lib/opendkim/opendkim.service.generate ]] && /lib/opendkim/opendkim.service.generate || true
     fi
