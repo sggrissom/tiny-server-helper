@@ -5,13 +5,42 @@ usage() {
   cat <<EOF
 Usage:
   mailctl doctor
+  mailctl setup <mail_hostname>
+  mailctl add <domain> [selector]
+  mailctl dns <domain>
+  mailctl verify <domain>
+  mailctl status
+  mailctl test <domain> <to_address>
+  mailctl rotate <domain> [selector]
+  mailctl activate <domain> <selector>
+  mailctl remove <domain>
 
 Examples:
   mailctl doctor
+  sudo mailctl setup mail.grissom.zone
+  sudo mailctl add grissom.zone
+  sudo mailctl dns grissom.zone
+  sudo mailctl verify grissom.zone
+  sudo mailctl status
+  sudo mailctl test grissom.zone you@gmail.com
+  sudo mailctl rotate grissom.zone 202702
+  sudo mailctl activate grissom.zone 202702
+  sudo mailctl remove releve.live
 EOF
 }
 
 die() { echo "Error: $*" >&2; exit 1; }
+
+TSH_DIR="/etc/tiny-server-helper"
+MAIL_ENV="$TSH_DIR/mail.env"
+DKIM_CONF="/etc/opendkim.conf"
+DKIM_DIR="/etc/opendkim"
+KEYS_DIR="$DKIM_DIR/keys"
+KEYTABLE="$DKIM_DIR/KeyTable"
+SIGNINGTABLE="$DKIM_DIR/SigningTable"
+TRUSTEDHOSTS="$DKIM_DIR/TrustedHosts"
+MILTER_PORT="8891"
+MILTER="inet:127.0.0.1:$MILTER_PORT"
 
 # ---------------------------------------------------------------------------
 # check output helpers
@@ -25,10 +54,48 @@ bad()  { printf "  %-34s ❌ %s\n" "$1" "${2:-}"; fails=$((fails + 1)); }
 warn() { printf "  %-34s ⚠  %s\n" "$1" "${2:-}"; }
 skip() { printf "  %-34s -  %s\n" "$1" "${2:-}"; }
 
+# Unlike appctl, setup applies many privileged writes in sequence; failing
+# halfway would leave Postfix partially reconfigured. Fail before touching
+# anything instead.
+need_root() { [[ "$(id -u)" -eq 0 ]] || die "$1 must run as root (use sudo)"; }
+
+# Same hostname regex appctl uses for `domain`, plus a dot so we reject
+# single-label names that can never be a real mail hostname.
+valid_fqdn() {
+  [[ "$1" == *.* ]] || return 1
+  [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]
+}
+
+# Follows bootstrap-vps's handling of caddy: detect, print the install line,
+# do not install. Keeps the toolkit free of package managers and distro checks.
+require_mail_packages() {
+  local missing=()
+  command -v postfix        >/dev/null 2>&1 || missing+=(postfix)
+  command -v opendkim       >/dev/null 2>&1 || missing+=(opendkim)
+  command -v opendkim-genkey >/dev/null 2>&1 || missing+=(opendkim-tools)
+  ((${#missing[@]})) || return 0
+
+  echo "NOTE: missing: ${missing[*]}"
+  echo "Install, then re-run:"
+  echo "  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y postfix opendkim opendkim-tools"
+  echo ""
+  echo "DEBIAN_FRONTEND=noninteractive skips postfix's debconf dialog; mailctl"
+  echo "overwrites the settings it would have asked about."
+  exit 1
+}
+
+# Listening addresses for a port, one per line. Empty if nothing is listening.
+listener_addrs() {
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -ltnH "( sport = :$1 )" 2>/dev/null | awk '{print $4}' | sort -u
+}
+
+is_wildcard_addr() { grep -qE '^(0\.0\.0\.0|\[?::\]?):[0-9]+$'; }
+
 # Public IP as the internet sees it. SPF records hardcode this, so it is the
 # single most important fact on the box.
 public_ip() {
-  local ip=""
+  local ip="" url
   for url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
     ip="$(curl -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')" || true
     [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
@@ -58,6 +125,252 @@ port25_open() {
     fi
   done
   return 1
+}
+
+# Write a file atomically, then set owner and mode. mktemp lands in the target
+# directory so the mv cannot cross filesystems.
+install_file() {
+  local dest="$1" owner="$2" mode="$3" tmp
+  tmp="$(mktemp "$(dirname "$dest")/.mailctl.XXXXXX")"
+  cat >"$tmp"
+  chown "$owner" "$tmp"
+  chmod "$mode" "$tmp"
+  mv "$tmp" "$dest"
+}
+
+require_setup() {
+  [[ -f "$DKIM_CONF" && -d "$KEYS_DIR" ]] \
+    || die "mail is not set up yet - run: sudo mailctl setup <mail_hostname>"
+}
+
+# ---------------------------------------------------------------------------
+# domain registry
+#
+# The filesystem is the registry, the way /srv/apps/*/ is for appctl. A domain
+# is registered if it has a key directory; it is *signing* only once an
+# `active` symlink points at one of its keys. Newly added domains are staged
+# (key on disk, no symlink) so nothing signs before its DNS is published.
+# ---------------------------------------------------------------------------
+registered_domains() {
+  local d
+  [[ -d "$KEYS_DIR" ]] || return 0
+  for d in "$KEYS_DIR"/*/; do
+    [[ -d "$d" ]] || continue
+    basename "$d"
+  done
+}
+
+active_selector() {
+  local link="$KEYS_DIR/$1/active" t
+  [[ -L "$link" ]] || return 1
+  t="$(basename "$(readlink "$link")")"
+  echo "${t%.private}"
+}
+
+# Newest key on disk regardless of whether it is active.
+newest_selector() {
+  local d="$1" kf
+  kf="$(ls -1t "$KEYS_DIR/$d"/*.private 2>/dev/null | head -n 1)" || return 1
+  [[ -n "$kf" ]] || return 1
+  kf="$(basename "$kf")"
+  echo "${kf%.private}"
+}
+
+domain_state() {
+  local d="$1"
+  [[ -d "$KEYS_DIR/$d" ]] || { echo none; return; }
+  if active_selector "$d" >/dev/null 2>&1; then echo active; else echo staged; fi
+}
+
+# Base64 public key derived from the private key, so what we publish and what
+# we verify always come from the same source rather than from genkey's .txt.
+pubkey_b64() {
+  openssl rsa -in "$1" -pubout 2>/dev/null | grep -v -- '-----' | tr -d '\n'
+}
+
+dkim_record() { echo "v=DKIM1; h=sha256; k=rsa; s=email; p=$(pubkey_b64 "$1")"; }
+
+# Is the DKIM record published for <domain>/<selector> the public half of
+# <keyfile>? This comparison is authoritative; opendkim-testkey is advisory,
+# since it does its own DNS and fails on resolver quirks that do not matter.
+dkim_matches() {
+  local domain="$1" sel="$2" keyfile="$3" published pub_p
+  published="$(dig_txt "${sel}._domainkey.$domain" | grep -i 'v=DKIM1' || true)"
+  [[ -n "$published" ]] || return 1
+  pub_p="$(printf '%s' "$published" | sed -E 's/.*[;[:space:]]*p=([A-Za-z0-9+/=]*).*/\1/')"
+  [[ "$pub_p" == "$(pubkey_b64 "$keyfile")" ]]
+}
+
+# Split a long TXT value into <=255-byte quoted strings for BIND zone files.
+split_txt() { fold -w 200 | sed 's/^/      "/; s/$/"/'; }
+
+# Join the quoted character-strings dig prints for a TXT record back into one
+# value. Do not strip spaces - "v=DKIM1; h=sha256" needs them.
+dig_txt() {
+  command -v dig >/dev/null 2>&1 || return 1
+  dig +short TXT "$1" 2>/dev/null | sed -e 's/" "//g' -e 's/^"//' -e 's/"$//'
+}
+
+# ---------------------------------------------------------------------------
+# table regeneration
+#
+# KeyTable lists every key on disk (unreferenced entries are inert).
+# SigningTable lists only active selectors, so staged keys never sign.
+# The wildcard second line lets subdomains share the parent's key: mail from
+# chess.grissom.zone gets d=grissom.zone, which passes DMARC under relaxed
+# alignment (adkim=r, the default).
+# ---------------------------------------------------------------------------
+build_signing_lhs() { printf '*@%s\n*@*.%s\n' "$1" "$1"; }
+
+# An optional <skip_domain> is excluded from both tables. `remove` uses it to
+# commit tables that no longer reference a domain *before* deleting its keys,
+# so a validation failure leaves keys and tables consistent with each other.
+regenerate_tables() {
+  local skip="${1:-}" tmp_kt tmp_st d sel kf out i
+  tmp_kt="$(mktemp "$DKIM_DIR/.mailctl.XXXXXX")"
+  tmp_st="$(mktemp "$DKIM_DIR/.mailctl.XXXXXX")"
+
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    [[ "$d" == "$skip" ]] && continue
+    for kf in "$KEYS_DIR/$d"/*.private; do
+      [[ -f "$kf" ]] || continue
+      sel="$(basename "$kf" .private)"
+      echo "$sel._domainkey.$d $d:$sel:$kf" >>"$tmp_kt"
+    done
+    if sel="$(active_selector "$d")"; then
+      while IFS= read -r lhs; do
+        echo "$lhs $sel._domainkey.$d" >>"$tmp_st"
+      done < <(build_signing_lhs "$d")
+    fi
+  done < <(registered_domains)
+
+  # Snapshot so a bad table can be rolled back.
+  cp -a "$KEYTABLE"     "$DKIM_DIR/.KeyTable.prev"     2>/dev/null || true
+  cp -a "$SIGNINGTABLE" "$DKIM_DIR/.SigningTable.prev" 2>/dev/null || true
+
+  chown root:opendkim "$tmp_kt" "$tmp_st"
+  chmod 0640 "$tmp_kt" "$tmp_st"
+  mv "$tmp_kt" "$KEYTABLE"
+  mv "$tmp_st" "$SIGNINGTABLE"
+
+  # Validate before the daemon ever sees them. Unlike appctl domain, which
+  # commits first and validates after, a failure here rolls back.
+  if ! out="$(opendkim -n -x "$DKIM_CONF" 2>&1)"; then
+    restore_tables
+    die "opendkim rejected the generated tables (rolled back):"$'\n'"$out"
+  fi
+
+  systemctl reload opendkim 2>/dev/null || systemctl restart opendkim
+
+  # With milter_default_action=tempfail, an opendkim that died on reload takes
+  # all outbound mail with it. Never exit 0 leaving it dead.
+  for i in 1 2 3 4 5; do
+    systemctl is-active --quiet opendkim && return 0
+    sleep 1
+  done
+  restore_tables
+  systemctl restart opendkim 2>/dev/null || true
+  die "opendkim did not come back after reload (tables rolled back) - check: journalctl -u opendkim -n 50"
+}
+
+restore_tables() {
+  [[ -f "$DKIM_DIR/.KeyTable.prev" ]]     && mv "$DKIM_DIR/.KeyTable.prev"     "$KEYTABLE"
+  [[ -f "$DKIM_DIR/.SigningTable.prev" ]] && mv "$DKIM_DIR/.SigningTable.prev" "$SIGNINGTABLE"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# DNS emission
+# ---------------------------------------------------------------------------
+emit_dns() {
+  local domain="$1" sel="$2" keyfile="$3" ip="$4" rec existing n mx state
+
+  rec="$(dkim_record "$keyfile")"
+
+  echo "=== DNS records for $domain ==="
+  echo ""
+
+  # --- SPF: exactly one v=spf1 TXT per domain, ever ---------------------
+  echo "[1] SPF  ->  $domain  TXT"
+  existing="$(dig_txt "$domain" | grep -i '^v=spf1' || true)"
+  n=0
+  [[ -n "$existing" ]] && n="$(printf '%s\n' "$existing" | grep -c .)"
+  if (( n == 0 )); then
+    echo "    ADD:"
+    echo "      v=spf1 ip4:${ip:-<server-ip>} ~all"
+    echo "    (tighten ~all to -all once verify and a real test both pass)"
+  elif (( n == 1 )); then
+    if [[ "$existing" == *"ip4:$ip"* ]]; then
+      echo "    ✅ already covers ip4:$ip - no change needed"
+      echo "      $existing"
+    else
+      echo "    ⚠  An SPF record already exists. Do NOT add a second one -"
+      echo "       two v=spf1 records is a permerror, which is worse than none."
+      echo "    MERGE:"
+      echo "      current:  $existing"
+      echo "      change to: $(printf '%s' "$existing" | sed -E "s/ (~all|-all|\\?all|\\+all)$/ ip4:${ip:-<server-ip>} \\1/")"
+    fi
+  else
+    echo "    ❌ $n v=spf1 records found - SPF is currently permerror."
+    echo "       Delete all but one before proceeding."
+    printf '%s\n' "$existing" | sed 's/^/         /'
+  fi
+  echo ""
+
+  # --- DKIM: emit both forms, panels and zone files disagree ------------
+  echo "[2] DKIM ->  ${sel}._domainkey.$domain  TXT"
+  echo "    Web panel (Cloudflare, Route 53, DO) - paste as ONE value:"
+  echo ""
+  echo "      $rec"
+  echo ""
+  echo "    BIND zone file - split into <=255-byte strings:"
+  echo ""
+  echo "    ${sel}._domainkey    IN    TXT    ("
+  printf '%s\n' "$rec" | split_txt
+  echo "    )"
+  echo ""
+  echo "    Note: if your panel appends the zone automatically, enter the name"
+  echo "    as '${sel}._domainkey', not the full '${sel}._domainkey.$domain'."
+  echo ""
+
+  # --- DMARC ------------------------------------------------------------
+  echo "[3] DMARC ->  _dmarc.$domain  TXT"
+  existing="$(dig_txt "_dmarc.$domain" | grep -i '^v=DMARC1' || true)"
+  if [[ -n "$existing" ]]; then
+    echo "    ✅ already published:"
+    echo "      $existing"
+  else
+    echo "    ADD:"
+    echo "      v=DMARC1; p=none; adkim=r; aspf=r; pct=100; rua=mailto:dmarc@$domain"
+    echo "    Start at p=none. Move to quarantine, then reject, only after"
+    echo "    reports show clean passes. adkim=r is required for subdomains to"
+    echo "    share this domain's key. Subdomains inherit via sp= and need no"
+    echo "    _dmarc record of their own."
+    echo "    If rua= points at a mailbox on another domain, that domain must"
+    echo "    authorize it or reports are silently dropped:"
+    echo "      $domain._report._dmarc.<rua-domain>  TXT  \"v=DMARC1\""
+  fi
+  echo ""
+
+  # --- null MX, only when the domain receives no mail -------------------
+  mx="$(dig +short MX "$domain" 2>/dev/null || true)"
+  echo "[4] MX   ->  $domain"
+  if [[ -z "$mx" ]]; then
+    echo "    ⚠  No MX record. Receivers fall back to the implicit MX (your A"
+    echo "       record), which points here - but port 25 is loopback-only, so"
+    echo "       bounces and sender-address callouts hang instead of failing"
+    echo "       fast. Some receivers reject or greylist for that."
+    echo "    CONSIDER:"
+    echo "      $domain.  IN MX  0 ."
+    echo "    This is a null MX (RFC 7505): 'this domain accepts no mail'."
+    echo "    It PERMANENTLY disables inbound mail for $domain until removed."
+  elif [[ "$mx" == "0 ." ]]; then
+    echo "    ✅ null MX published - domain correctly declares it accepts no mail"
+  else
+    echo "    ✅ receives mail elsewhere - leave MX alone"
+    printf '%s\n' "$mx" | sed 's/^/         /'
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -96,7 +409,6 @@ case "$cmd" in
     fi
 
     # --- PTR / forward-confirmed reverse DNS ------------------------------
-    ptr=""
     if [[ -z "$ip" ]]; then
       skip "Reverse DNS (PTR)" "no public IP"
       skip "Forward-confirmed (FCrDNS)" ""
@@ -166,10 +478,10 @@ case "$cmd" in
     elif ! command -v ss >/dev/null 2>&1; then
       skip "Listener :25" "ss not installed"
     else
-      listeners="$(ss -ltnH '( sport = :25 )' 2>/dev/null | awk '{print $4}' | sort -u)"
+      listeners="$(listener_addrs 25 || true)"
       if [[ -z "$listeners" ]]; then
         bad "Listener :25" "nothing listening"
-      elif echo "$listeners" | grep -qE '^(0\.0\.0\.0|\[?::\]?):25$'; then
+      elif echo "$listeners" | is_wildcard_addr; then
         bad "Listener :25" "OPEN TO THE INTERNET ($(echo "$listeners" | tr '\n' ' '))"
       else
         ok "Listener :25" "$(echo "$listeners" | tr '\n' ' ')"
@@ -178,17 +490,17 @@ case "$cmd" in
 
     # --- opendkim milter socket ------------------------------------------
     if [[ "$have_opendkim" == no ]]; then
-      skip "Listener :8891" "opendkim not installed"
+      skip "Listener :$MILTER_PORT" "opendkim not installed"
     elif ! command -v ss >/dev/null 2>&1; then
-      skip "Listener :8891" "ss not installed"
+      skip "Listener :$MILTER_PORT" "ss not installed"
     else
-      dkl="$(ss -ltnH '( sport = :8891 )' 2>/dev/null | awk '{print $4}' | sort -u)"
+      dkl="$(listener_addrs "$MILTER_PORT" || true)"
       if [[ -z "$dkl" ]]; then
-        skip "Listener :8891" "not listening (setup not run?)"
-      elif echo "$dkl" | grep -qE '^(0\.0\.0\.0|\[?::\]?):8891$'; then
-        bad "Listener :8891" "bound to all interfaces ($(echo "$dkl" | tr '\n' ' '))"
+        skip "Listener :$MILTER_PORT" "not listening (setup not run?)"
+      elif echo "$dkl" | is_wildcard_addr; then
+        bad "Listener :$MILTER_PORT" "bound to all interfaces ($(echo "$dkl" | tr '\n' ' '))"
       else
-        ok "Listener :8891" "$(echo "$dkl" | tr '\n' ' ')"
+        ok "Listener :$MILTER_PORT" "$(echo "$dkl" | tr '\n' ' ')"
       fi
     fi
 
@@ -257,6 +569,550 @@ case "$cmd" in
     fi
 
     echo "✅ All checks passed."
+    ;;
+
+  setup)
+    need_root setup
+    host="${2:-}"
+    [[ -n "$host" ]] || die "missing <mail_hostname>"
+    valid_fqdn "$host" || die "invalid mail hostname: $host"
+
+    require_mail_packages
+    getent passwd opendkim >/dev/null 2>&1 || die "opendkim user missing - reinstall the opendkim package"
+
+    echo "== mailctl setup =="
+    echo "  Mail hostname: $host"
+    echo ""
+
+    # --- DNS sanity, advisory only ---------------------------------------
+    # These are set elsewhere and may legitimately lag behind setup.
+    if ip="$(public_ip)" && command -v dig >/dev/null 2>&1; then
+      a_rec="$(dig +short A "$host" 2>/dev/null | head -n 1)"
+      [[ "$a_rec" == "$ip" ]] \
+        && ok "A record" "$host -> $ip" \
+        || warn "A record" "$host -> ${a_rec:-<none>}, expected $ip"
+
+      ptr="$(undot "$(dig +short -x "$ip" 2>/dev/null | head -n 1)")"
+      [[ "$ptr" == "$host" ]] \
+        && ok "Reverse DNS (PTR)" "$ip -> $host" \
+        || warn "Reverse DNS (PTR)" "$ip -> ${ptr:-<none>}, expected $host"
+      echo ""
+    fi
+
+    # --- Postfix ----------------------------------------------------------
+    # postconf -e is idempotent by construction: it rewrites the line if
+    # present and appends it if not, so re-running setup is a no-op.
+    echo "Configuring Postfix..."
+    postconf -e \
+      "myhostname = $host" \
+      'myorigin = $myhostname' \
+      'smtp_helo_name = $myhostname' \
+      'smtpd_banner = $myhostname ESMTP' \
+      'mydestination = $myhostname, localhost.$mydomain, localhost' \
+      "relayhost =" \
+      "inet_interfaces = loopback-only" \
+      "inet_protocols = ipv4" \
+      "mynetworks = 127.0.0.0/8 [::1]/128" \
+      "mynetworks_style = host" \
+      "smtpd_relay_restrictions = permit_mynetworks, reject" \
+      "smtpd_recipient_restrictions = permit_mynetworks, reject_unauth_destination" \
+      "smtpd_client_restrictions = permit_mynetworks, reject" \
+      "smtpd_helo_required = yes" \
+      "disable_vrfy_command = yes" \
+      "smtp_tls_security_level = may" \
+      "smtp_tls_note_starttls_offer = yes" \
+      "smtp_tls_loglevel = 1" \
+      "smtp_tls_CApath = /etc/ssl/certs" \
+      "milter_protocol = 6" \
+      "milter_default_action = tempfail" \
+      "smtpd_milters = $MILTER" \
+      "non_smtpd_milters = $MILTER" \
+      "maximal_queue_lifetime = 3d" \
+      "bounce_queue_lifetime = 1d" \
+      "notify_classes = resource, software, bounce, 2bounce" \
+      "message_size_limit = 20480000"
+
+    echo "$host" | install_file /etc/mailname root:root 0644
+
+    # postmaster must resolve somewhere. The root: target is the human's call,
+    # so we only guarantee the postmaster -> root hop.
+    if [[ -f /etc/aliases ]] && ! grep -qE '^postmaster:' /etc/aliases; then
+      echo "postmaster: root" >>/etc/aliases
+    fi
+    [[ -f /etc/aliases ]] && newaliases 2>/dev/null || true
+
+    # --- OpenDKIM ---------------------------------------------------------
+    echo "Configuring OpenDKIM..."
+    mkdir -p "$DKIM_DIR" "$KEYS_DIR"
+    chown root:opendkim "$DKIM_DIR"
+    chmod 0750 "$DKIM_DIR"
+    chown opendkim:opendkim "$KEYS_DIR"
+    chmod 0700 "$KEYS_DIR"
+
+    install_file "$DKIM_CONF" root:root 0644 <<EOF
+# Managed by mailctl. Regenerated by 'mailctl setup'.
+Syslog                  yes
+SyslogSuccess           yes
+LogWhy                  no
+
+UserID                  opendkim
+UMask                   007
+PidFile                 /run/opendkim/opendkim.pid
+
+# Sign only. The verification code path never runs, so this daemon never
+# parses untrusted input - it only sees mail our own apps submitted locally.
+Mode                    s
+
+# A loopback TCP socket avoids the whole chroot/permissions class of bugs that
+# comes with a unix socket under /var/spool/postfix. It grants no capability
+# that 127.0.0.1:25 does not already grant to the same local users.
+Socket                  $MILTER
+
+Canonicalization        relaxed/simple
+SignatureAlgorithm      rsa-sha256
+MinimumKeyBits          1024
+
+# Sign From once more than it appears, so a replayed message cannot keep a
+# valid signature by prepending a second From header.
+OversignHeaders         From
+
+KeyTable                refile:$KEYTABLE
+SigningTable            refile:$SIGNINGTABLE
+InternalHosts           refile:$TRUSTEDHOSTS
+ExternalIgnoreList      refile:$TRUSTEDHOSTS
+EOF
+
+    # InternalHosts is the list OpenDKIM *signs* for. Without 127.0.0.1 here,
+    # nothing is ever signed while everything else looks healthy.
+    install_file "$TRUSTEDHOSTS" root:opendkim 0640 <<EOF
+127.0.0.1
+::1
+localhost
+$host
+EOF
+
+    # Never clobber existing tables - they are derived from the keys on disk.
+    for t in "$KEYTABLE" "$SIGNINGTABLE"; do
+      if [[ ! -f "$t" ]]; then
+        : | install_file "$t" root:opendkim 0640
+      fi
+    done
+
+    # Debian generates a systemd override from SOCKET= in /etc/default/opendkim
+    # which can silently contradict opendkim.conf. Keep the two in agreement.
+    if [[ -f /etc/default/opendkim ]]; then
+      if grep -qE '^\s*#?\s*SOCKET=' /etc/default/opendkim; then
+        sed -i "s|^\s*#\?\s*SOCKET=.*|SOCKET=\"inet:$MILTER_PORT@localhost\"|" /etc/default/opendkim
+      else
+        echo "SOCKET=\"inet:$MILTER_PORT@localhost\"" >>/etc/default/opendkim
+      fi
+      [[ -x /lib/opendkim/opendkim.service.generate ]] && /lib/opendkim/opendkim.service.generate || true
+    fi
+
+    # --- env injection for apps -------------------------------------------
+    # A drop-in rather than an edit to systemd/app@.service keeps the unit
+    # templates in git mail-agnostic and makes uninstall an rm.
+    echo "Wiring SMTP env into app units..."
+    mkdir -p "$TSH_DIR"
+    install_file "$MAIL_ENV" root:root 0644 <<EOF
+# Managed by mailctl. Read by app@ and internal@ units via a systemd drop-in.
+# Nothing here is secret - loopback submission is the whole design.
+# Per-app MAIL_FROM belongs in /srv/apps/<app>/shared/.env, not here.
+SMTP_HOST=127.0.0.1
+SMTP_PORT=25
+MAIL_HOSTNAME=$host
+EOF
+
+    for unit in app internal; do
+      mkdir -p "/etc/systemd/system/${unit}@.service.d"
+      install_file "/etc/systemd/system/${unit}@.service.d/10-mail.conf" root:root 0644 <<EOF
+# Managed by mailctl. Gives every $unit@ service SMTP_HOST/SMTP_PORT with no
+# per-app config and no redeploy - EnvironmentFile is read at each ExecStart.
+#
+# Do not add PrivateNetwork=yes, IPAddressDeny=, or a restrictive
+# RestrictAddressFamilies= to these units: loopback SMTP breaks and the
+# failure looks like a Postfix problem, not a systemd one.
+[Service]
+EnvironmentFile=-$MAIL_ENV
+EOF
+    done
+    systemctl daemon-reload
+
+    # --- start ------------------------------------------------------------
+    # These are infrastructure, not app units, so mailctl enables them rather
+    # than printing an enable line the way appctl init does.
+    echo "Starting services..."
+    systemctl enable opendkim >/dev/null 2>&1 || true
+    systemctl enable postfix  >/dev/null 2>&1 || true
+    systemctl restart opendkim
+    # inet_interfaces only takes effect on a full restart, never on reload.
+    systemctl restart postfix
+
+    echo ""
+    echo "Verifying..."
+    dkl="$(listener_addrs "$MILTER_PORT" || true)"
+    [[ -n "$dkl" ]] || die "opendkim is not listening on $MILTER_PORT - check: journalctl -u opendkim -n 50"
+    ok "Listener :$MILTER_PORT" "$(echo "$dkl" | tr '\n' ' ')"
+
+    l25="$(listener_addrs 25 || true)"
+    [[ -n "$l25" ]] || die "postfix is not listening on 25 - check: journalctl -u postfix -n 50"
+    if echo "$l25" | is_wildcard_addr; then
+      die "postfix is listening on all interfaces - inet_interfaces did not apply"
+    fi
+    ok "Listener :25" "$(echo "$l25" | tr '\n' ' ')"
+
+    echo ""
+    echo "✅ Setup complete."
+    echo ""
+    echo "Next steps:"
+    echo "  1. Point /etc/aliases root: at a mailbox you actually read, then"
+    echo "     run newaliases. Without it, bounces and Postfix error notices"
+    echo "     are lost:"
+    echo "       root: you@example.com"
+    echo "  2. Publish DNS for the mail hostname itself:"
+    echo "       $host.  IN A    ${ip:-<server-ip>}"
+    echo "       $host.  IN TXT  \"v=spf1 a -all\""
+    echo "  3. Set reverse DNS for ${ip:-<server-ip>} to $host at your VPS provider"
+    echo "  4. Register a sending domain:  sudo mailctl add example.com"
+    echo "  5. Restart apps to pick up SMTP_HOST/SMTP_PORT (no redeploy needed):"
+    echo "       sudo systemctl restart app@<name>"
+    ;;
+
+  add)
+    need_root add
+    require_mail_packages
+    require_setup
+    domain="${2:-}"
+    selector="${3:-$(date +%Y%m)}"
+    [[ -n "$domain" ]] || die "missing <domain>"
+    valid_fqdn "$domain" || die "invalid domain: $domain"
+    [[ "$selector" =~ ^[a-zA-Z0-9_-]+$ ]] || die "invalid selector: $selector"
+
+    ip="$(public_ip || true)"
+    dir="$KEYS_DIR/$domain"
+    state="$(domain_state "$domain")"
+
+    if [[ "$state" != none ]]; then
+      # Create-once, like appctl init's shared/.env. Never silently replace a
+      # key - that would invalidate DNS that is already published.
+      sel="$(active_selector "$domain" 2>/dev/null || newest_selector "$domain")"
+      echo "$domain is already registered (selector $sel, state: $state)."
+      echo "Keeping the existing key. To roll to a new one: sudo mailctl rotate $domain"
+      echo ""
+      emit_dns "$domain" "$sel" "$dir/$sel.private" "$ip"
+      exit 0
+    fi
+
+    echo "Generating 2048-bit DKIM key for $domain (selector $selector)..."
+    mkdir -p "$dir"
+    opendkim-genkey -b 2048 -r -h sha256 -d "$domain" -s "$selector" -D "$dir"
+    chown -R opendkim:opendkim "$dir"
+    chmod 0700 "$dir"
+    chmod 0600 "$dir/$selector.private"
+    chmod 0644 "$dir/$selector.txt"
+
+    # Staged, not signing: the key is in KeyTable but has no `active` symlink,
+    # so SigningTable has no entry for it. Nothing is signed until the DNS is
+    # published and `mailctl verify` confirms it.
+    regenerate_tables
+
+    echo ""
+    emit_dns "$domain" "$selector" "$dir/$selector.private" "$ip"
+    echo ""
+    echo "Status: STAGED - $domain is not signing yet."
+    echo ""
+    echo "Next steps:"
+    echo "  1. Publish the records above at your DNS provider"
+    echo "  2. Wait for propagation (usually a few minutes)"
+    echo "  3. sudo mailctl verify $domain    # activates signing once DKIM checks out"
+    ;;
+
+  dns)
+    # Reading the key to derive the public half needs root: key dirs are 0700.
+    need_root dns
+    require_setup
+    domain="${2:-}"
+    [[ -n "$domain" ]] || die "missing <domain>"
+    [[ "$(domain_state "$domain")" != none ]] || die "$domain is not registered - run: sudo mailctl add $domain"
+    sel="$(active_selector "$domain" 2>/dev/null || newest_selector "$domain")"
+    emit_dns "$domain" "$sel" "$KEYS_DIR/$domain/$sel.private" "$(public_ip || true)"
+    ;;
+
+  remove)
+    need_root remove
+    require_setup
+    domain="${2:-}"
+    [[ -n "$domain" ]] || die "missing <domain>"
+    [[ "$(domain_state "$domain")" != none ]] || die "$domain is not registered"
+
+    sel="$(active_selector "$domain" 2>/dev/null || newest_selector "$domain")"
+    echo "Removing $domain (selector $sel)..."
+    # Commit tables without the domain first. If that fails it rolls back and
+    # dies with the keys still in place, rather than orphaning them.
+    regenerate_tables "$domain"
+    rm -rf "${KEYS_DIR:?}/${domain:?}"
+
+    echo "✅ Removed. $domain no longer has a key or a signing rule."
+    echo ""
+    echo "Note: mail with a From address at $domain will now go out UNSIGNED"
+    echo "rather than being rejected - a missing signing rule is a silent"
+    echo "pass-through, unlike a dead milter."
+    echo ""
+    echo "Next steps - delete these DNS records:"
+    echo "  ${sel}._domainkey.$domain   TXT"
+    echo "  _dmarc.$domain              TXT   (only if nothing else sends for it)"
+    echo "Review SPF for $domain: remove ip4:$(public_ip || echo '<server-ip>')"
+    echo "only if no other service on this box sends as $domain."
+    ;;
+
+  verify)
+    need_root verify
+    require_setup
+    command -v dig >/dev/null 2>&1 || die "dig is required (apt-get install -y dnsutils)"
+    domain="${2:-}"
+    [[ -n "$domain" ]] || die "missing <domain>"
+    state="$(domain_state "$domain")"
+    [[ "$state" != none ]] || die "$domain is not registered - run: sudo mailctl add $domain"
+
+    sel="$(active_selector "$domain" 2>/dev/null || newest_selector "$domain")"
+    keyfile="$KEYS_DIR/$domain/$sel.private"
+    ip="$(public_ip || true)"
+
+    echo "== verify $domain (selector $sel, state: $state) =="
+    echo ""
+
+    # --- DKIM: the published key must match the private key we sign with ---
+    dkim_ok=no
+    if dkim_matches "$domain" "$sel" "$keyfile"; then
+      ok "DKIM (${sel}._domainkey)" "published, matches local key"
+      dkim_ok=yes
+    elif [[ -z "$(dig_txt "${sel}._domainkey.$domain" | grep -i 'v=DKIM1' || true)" ]]; then
+      bad "DKIM (${sel}._domainkey)" "not published"
+    else
+      bad "DKIM (${sel}._domainkey)" "published key does NOT match the private key"
+    fi
+    # Secondary signal; the comparison above is authoritative.
+    if [[ "$dkim_ok" == yes ]] && command -v opendkim-testkey >/dev/null 2>&1; then
+      if opendkim-testkey -d "$domain" -s "$sel" -k "$keyfile" >/dev/null 2>&1; then
+        ok "opendkim-testkey" "passed"
+      else
+        warn "opendkim-testkey" "reported a problem (often DNSSEC/resolver related)"
+      fi
+    fi
+
+    # --- SPF ---------------------------------------------------------------
+    spf="$(dig_txt "$domain" | grep -i '^v=spf1' || true)"
+    spf_n=0
+    [[ -n "$spf" ]] && spf_n="$(printf '%s\n' "$spf" | grep -c .)"
+    if (( spf_n == 0 )); then
+      bad "SPF" "no v=spf1 record"
+    elif (( spf_n > 1 )); then
+      bad "SPF" "$spf_n records - permerror, delete all but one"
+    elif [[ -n "$ip" && "$spf" == *"ip4:$ip"* ]]; then
+      ok "SPF" "covers ip4:$ip"
+    else
+      bad "SPF" "does not list ip4:${ip:-<server-ip>} - $spf"
+    fi
+
+    # --- DMARC -------------------------------------------------------------
+    dmarc="$(dig_txt "_dmarc.$domain" | grep -i '^v=DMARC1' || true)"
+    if [[ -z "$dmarc" ]]; then
+      bad "DMARC" "no _dmarc record"
+    else
+      policy="$(printf '%s' "$dmarc" | sed -E 's/.*p=([a-z]+).*/\1/')"
+      ok "DMARC" "p=$policy"
+    fi
+
+    # --- MX: informational only -------------------------------------------
+    mx="$(dig +short MX "$domain" 2>/dev/null || true)"
+    if [[ -z "$mx" ]]; then
+      warn "MX" "none - consider a null MX (see: sudo mailctl dns $domain)"
+    elif [[ "$mx" == "0 ." ]]; then
+      ok "MX" "null MX (accepts no mail)"
+    else
+      ok "MX" "$(printf '%s' "$mx" | tr '\n' ' ')"
+    fi
+
+    echo ""
+    # --- activate a staged domain once its DKIM is provably live ----------
+    if [[ "$dkim_ok" == yes && "$state" == staged ]]; then
+      echo "DKIM is live. Activating signing for $domain..."
+      ln -sfn "$sel.private" "$KEYS_DIR/$domain/active"
+      chown -h opendkim:opendkim "$KEYS_DIR/$domain/active"
+      regenerate_tables
+      echo "✅ $domain is now signing with selector $sel."
+    elif [[ "$dkim_ok" == no && "$state" == staged ]]; then
+      echo "$domain stays STAGED (not signing) until its DKIM record is live."
+    fi
+
+    if (( fails > 0 )); then
+      echo ""
+      echo "❌ $fails check(s) failed."
+      exit 1
+    fi
+    echo ""
+    echo "✅ $domain checks out."
+    ;;
+
+  status)
+    need_root status
+    require_setup
+    any=no
+    while IFS= read -r d; do
+      [[ -n "$d" ]] || continue
+      any=yes
+      st="$(domain_state "$d")"
+      s="$(active_selector "$d" 2>/dev/null || newest_selector "$d" || echo '-')"
+      dns_state="unknown"
+      if command -v dig >/dev/null 2>&1; then
+        if dig_txt "${s}._domainkey.$d" | grep -qi 'v=DKIM1'; then
+          dns_state="published"
+        else
+          dns_state="MISSING"
+        fi
+      fi
+      printf "%-28s %-8s %-10s %s\n" "$d" "$st" "$s" "$dns_state"
+    done < <(registered_domains)
+    [[ "$any" == yes ]] || echo "(no domains registered - sudo mailctl add <domain>)"
+
+    echo ""
+    p_state="stopped"; systemctl is-active --quiet postfix  2>/dev/null && p_state="active"
+    o_state="stopped"; systemctl is-active --quiet opendkim 2>/dev/null && o_state="active"
+    qcount="$(postqueue -p 2>/dev/null | grep -cE '^[0-9A-F]{6,}[*!]?' || true)"
+    echo "postfix: $p_state   opendkim: $o_state   queue: ${qcount:-0}"
+    ;;
+
+  test)
+    need_root test
+    require_setup
+    domain="${2:-}"
+    to="${3:-}"
+    [[ -n "$domain" ]] || die "missing <domain>"
+    [[ -n "$to" ]] || die "missing <to_address>"
+    [[ "$to" == *@* ]] || die "invalid recipient: $to"
+    [[ "$(domain_state "$domain")" == active ]] \
+      || die "$domain is not signing yet (state: $(domain_state "$domain")) - run: sudo mailctl verify $domain"
+    command -v sendmail >/dev/null 2>&1 || die "sendmail not found - is postfix installed?"
+
+    from="noreply@$domain"
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    echo "Sending test message: $from -> $to"
+
+    # Submitted via sendmail (the pickup path), which only gets signed because
+    # main.cf sets non_smtpd_milters as well as smtpd_milters.
+    sendmail -f "$from" "$to" <<EOF
+From: tiny-server-helper <$from>
+To: $to
+Subject: mailctl test $stamp
+Date: $(date -R)
+Message-ID: <mailctl-$stamp@$domain>
+
+This is a test message from mailctl on $(hostname -f 2>/dev/null || hostname).
+
+Domain:   $domain
+Selector: $(active_selector "$domain")
+Sent:     $(date -R)
+EOF
+
+    echo "✅ Queued."
+    echo ""
+    echo "Next steps:"
+    echo "  1. Check the received message's headers for all three:"
+    echo "       Authentication-Results: ... dkim=pass header.d=$domain"
+    echo "       Authentication-Results: ... spf=pass"
+    echo "       Authentication-Results: ... dmarc=pass"
+    echo "  2. Confirm it was signed locally:"
+    echo "       journalctl -u opendkim -n 20 | grep 'DKIM-Signature field added'"
+    echo "  3. Confirm it was delivered:"
+    echo "       journalctl -u postfix -n 30 | grep 'status=sent'"
+    echo "  4. Anything stuck?  postqueue -p"
+    echo ""
+    echo "For a full third-party report, forward the message to:"
+    echo "  check-auth@verifier.port25.com"
+    ;;
+
+  rotate)
+    # Phase 1 of 2. Generates a new key alongside the old one and adds it to
+    # KeyTable, but leaves `active` alone - so signing does not change and no
+    # in-flight mail breaks. `activate` is phase 2.
+    need_root rotate
+    require_mail_packages
+    require_setup
+    domain="${2:-}"
+    selector="${3:-$(date +%Y%m)}"
+    [[ -n "$domain" ]] || die "missing <domain>"
+    [[ "$(domain_state "$domain")" != none ]] || die "$domain is not registered"
+    [[ "$selector" =~ ^[a-zA-Z0-9_-]+$ ]] || die "invalid selector: $selector"
+
+    dir="$KEYS_DIR/$domain"
+    cur="$(active_selector "$domain" 2>/dev/null || newest_selector "$domain")"
+    [[ "$selector" != "$cur" ]] || die "selector $selector is already in use - pass a different one, e.g. sudo mailctl rotate $domain $(date +%Y%m)b"
+    [[ ! -f "$dir/$selector.private" ]] || die "a key for selector $selector already exists"
+
+    echo "Generating replacement key for $domain (selector $selector, current: $cur)..."
+    opendkim-genkey -b 2048 -r -h sha256 -d "$domain" -s "$selector" -D "$dir"
+    chown opendkim:opendkim "$dir/$selector.private" "$dir/$selector.txt"
+    chmod 0600 "$dir/$selector.private"
+    chmod 0644 "$dir/$selector.txt"
+    regenerate_tables
+
+    echo ""
+    echo "=== New DKIM record for $domain ==="
+    echo ""
+    echo "  ${selector}._domainkey.$domain  TXT"
+    echo ""
+    echo "  Web panel - paste as ONE value:"
+    echo ""
+    echo "    $(dkim_record "$dir/$selector.private")"
+    echo ""
+    echo "  BIND zone file:"
+    echo ""
+    echo "  ${selector}._domainkey    IN    TXT    ("
+    printf '%s\n' "$(dkim_record "$dir/$selector.private")" | split_txt
+    echo "  )"
+    echo ""
+    echo "Signing is UNCHANGED - $domain still signs with $cur."
+    echo ""
+    echo "Next steps:"
+    echo "  1. Publish the record above (leave the $cur record in place)"
+    echo "  2. sudo mailctl activate $domain $selector"
+    ;;
+
+  activate)
+    # Phase 2 of 2. Refuses unless the new key is provably live in DNS, so a
+    # rotation can never switch signing to a key nobody can verify.
+    need_root activate
+    require_setup
+    command -v dig >/dev/null 2>&1 || die "dig is required (apt-get install -y dnsutils)"
+    domain="${2:-}"
+    selector="${3:-}"
+    [[ -n "$domain" ]] || die "missing <domain>"
+    [[ -n "$selector" ]] || die "missing <selector>"
+    [[ "$(domain_state "$domain")" != none ]] || die "$domain is not registered"
+
+    dir="$KEYS_DIR/$domain"
+    [[ -f "$dir/$selector.private" ]] || die "no key for selector $selector - run: sudo mailctl rotate $domain $selector"
+    prev="$(active_selector "$domain" 2>/dev/null || echo '')"
+
+    echo "Checking that ${selector}._domainkey.$domain is live..."
+    dkim_matches "$domain" "$selector" "$dir/$selector.private" \
+      || die "the published record for $selector does not match its private key (or is not published yet) - publish it and retry"
+    ok "DKIM (${selector}._domainkey)" "published, matches local key"
+
+    ln -sfn "$selector.private" "$dir/active"
+    chown -h opendkim:opendkim "$dir/active"
+    regenerate_tables
+
+    echo ""
+    echo "✅ $domain now signs with selector $selector."
+    if [[ -n "$prev" && "$prev" != "$selector" ]]; then
+      echo ""
+      echo "Next steps:"
+      echo "  1. Leave ${prev}._domainkey.$domain published for ~7 days so mail"
+      echo "     already in flight can still be verified"
+      echo "  2. Then delete that DNS record and the old key:"
+      echo "       sudo rm $dir/${prev}.private $dir/${prev}.txt"
+    fi
     ;;
 
   *)
