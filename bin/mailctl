@@ -289,33 +289,55 @@ restore_tables() {
 # ---------------------------------------------------------------------------
 # DNS emission
 # ---------------------------------------------------------------------------
+# Print a value to paste. It goes flush-left between fences, alone on its
+# line, so selecting it cannot pick up any surrounding prose - a DMARC record
+# once went out with three lines of this tool's own guidance inside it.
+paste_value() {
+  echo "    +--- copy the line below, and nothing else ----------------"
+  printf '%s\n' "$1"
+  echo "    +----------------------------------------------------------"
+}
+
 emit_dns() {
-  local domain="$1" sel="$2" keyfile="$3" ip="$4" rec existing n mx state
+  local domain="$1" sel="$2" keyfile="$3" ip="$4"
+  local rec existing n mx receives_mail dmarc
 
   rec="$(dkim_record "$keyfile")"
 
+  # Whether the domain receives mail decides two things below: whether to
+  # suggest a null MX, and whether a rua= address at this domain could ever
+  # collect reports. Suggesting both at once is a contradiction.
+  mx="$(dig +short MX "$domain" 2>/dev/null || true)"
+  receives_mail=no
+  [[ -n "$mx" && "$mx" != "0 ." ]] && receives_mail=yes
+
   echo "=== DNS records for $domain ==="
+  echo ""
+  echo "Each record below gives the panel fields, then the exact value."
+  echo "Copy only what is between the +--- fences. The Notes are not part"
+  echo "of any record."
   echo ""
 
   # --- SPF: exactly one v=spf1 TXT per domain, ever ---------------------
-  echo "[1] SPF  ->  $domain  TXT"
+  echo "[1] SPF"
+  echo "    Type: TXT    Host: @  (or blank, for the domain itself)"
   existing="$(dig_txt "$domain" | grep -i '^v=spf1' || true)"
   n=0
   [[ -n "$existing" ]] && n="$(printf '%s\n' "$existing" | grep -c .)"
   if (( n == 0 )); then
-    echo "    ADD:"
-    echo "      v=spf1 ip4:${ip:-<server-ip>} ~all"
-    echo "    (tighten ~all to -all once verify and a real test both pass)"
+    paste_value "v=spf1 ip4:${ip:-<server-ip>} ~all"
+    echo "    Notes:"
+    echo "      * Tighten ~all to -all once verify and a real test both pass."
   elif (( n == 1 )); then
     if [[ "$existing" == *"ip4:$ip"* ]]; then
       echo "    ✅ already covers ip4:$ip - no change needed"
-      echo "      $existing"
+      echo "       $existing"
     else
-      echo "    ⚠  An SPF record already exists. Do NOT add a second one -"
-      echo "       two v=spf1 records is a permerror, which is worse than none."
-      echo "    MERGE:"
-      echo "      current:  $existing"
-      echo "      change to: $(printf '%s' "$existing" | sed -E "s/ (~all|-all|\\?all|\\+all)$/ ip4:${ip:-<server-ip>} \\1/")"
+      echo "    ⚠  An SPF record already exists. EDIT it - do not add a second."
+      echo "       Two v=spf1 records is a permerror, which is worse than none."
+      echo "       Current value:"
+      echo "         $existing"
+      paste_value "$(printf '%s' "$existing" | sed -E "s/ (~all|-all|\\?all|\\+all)$/ ip4:${ip:-<server-ip>} \\1/")"
     fi
   else
     echo "    ❌ $n v=spf1 records found - SPF is currently permerror."
@@ -325,52 +347,70 @@ emit_dns() {
   echo ""
 
   # --- DKIM: emit both forms, panels and zone files disagree ------------
-  echo "[2] DKIM ->  ${sel}._domainkey.$domain  TXT"
-  echo "    Web panel (Cloudflare, Route 53, DO) - paste as ONE value:"
+  echo "[2] DKIM"
+  echo "    Type: TXT    Host: ${sel}._domainkey"
+  paste_value "$rec"
+  echo "    Notes:"
+  echo "      * That is ONE line, however your terminal wraps it."
+  echo "      * If your panel appends the zone name for you, enter the Host as"
+  echo "        '${sel}._domainkey', not '${sel}._domainkey.$domain'."
+  echo "      * Only for a BIND zone file, use this split form instead:"
   echo ""
-  echo "      $rec"
-  echo ""
-  echo "    BIND zone file - split into <=255-byte strings:"
-  echo ""
-  echo "    ${sel}._domainkey    IN    TXT    ("
-  printf '%s\n' "$rec" | split_txt
-  echo "    )"
-  echo ""
-  echo "    Note: if your panel appends the zone automatically, enter the name"
-  echo "    as '${sel}._domainkey', not the full '${sel}._domainkey.$domain'."
+  echo "          ${sel}._domainkey    IN    TXT    ("
+  printf '%s\n' "$rec" | split_txt | sed 's/^/    /'
+  echo "          )"
   echo ""
 
   # --- DMARC ------------------------------------------------------------
-  echo "[3] DMARC ->  _dmarc.$domain  TXT"
+  echo "[3] DMARC"
+  echo "    Type: TXT    Host: _dmarc"
   existing="$(dig_txt "_dmarc.$domain" | grep -i '^v=DMARC1' || true)"
   if [[ -n "$existing" ]]; then
     echo "    ✅ already published:"
-    echo "      $existing"
+    echo "       $existing"
   else
-    echo "    ADD:"
-    echo "      v=DMARC1; p=none; adkim=r; aspf=r; pct=100; rua=mailto:dmarc@$domain"
-    echo "    Start at p=none. Move to quarantine, then reject, only after"
-    echo "    reports show clean passes. adkim=r is required for subdomains to"
-    echo "    share this domain's key. Subdomains inherit via sp= and need no"
-    echo "    _dmarc record of their own."
-    echo "    If rua= points at a mailbox on another domain, that domain must"
-    echo "    authorize it or reports are silently dropped:"
-    echo "      $domain._report._dmarc.<rua-domain>  TXT  \"v=DMARC1\""
+    # rua= is only offered when a mailbox at this domain could actually
+    # receive the reports. A domain with a null MX cannot, and pointing rua
+    # at a third-party address needs an authorization record on that other
+    # domain, which the operator usually cannot publish.
+    if [[ "$receives_mail" == yes ]]; then
+      dmarc="v=DMARC1; p=none; adkim=r; aspf=r; rua=mailto:dmarc@$domain"
+    else
+      dmarc="v=DMARC1; p=none; adkim=r; aspf=r"
+    fi
+    paste_value "$dmarc"
+    echo "    Notes:"
+    echo "      * Start at p=none. Move to quarantine, then reject, only after"
+    echo "        reports show clean passes."
+    echo "      * adkim=r lets subdomains share this domain's key. Subdomains"
+    echo "        inherit via sp= and need no _dmarc record of their own."
+    if [[ "$receives_mail" == yes ]]; then
+      echo "      * rua= points at this domain, which receives mail, so reports"
+      echo "        can be delivered. Sending them to an address on a DIFFERENT"
+      echo "        domain requires that domain to publish:"
+      echo "          $domain._report._dmarc.<rua-domain>  TXT  v=DMARC1"
+    else
+      echo "      * No rua= is included: $domain accepts no mail, so reports"
+      echo "        sent there could never arrive. To collect them, use a DMARC"
+      echo "        reporting service - it supplies an address on its own domain"
+      echo "        and publishes the authorization record for you."
+    fi
   fi
   echo ""
 
   # --- null MX, only when the domain receives no mail -------------------
-  mx="$(dig +short MX "$domain" 2>/dev/null || true)"
-  echo "[4] MX   ->  $domain"
+  echo "[4] MX"
   if [[ -z "$mx" ]]; then
-    echo "    ⚠  No MX record. Receivers fall back to the implicit MX (your A"
-    echo "       record), which points here - but port 25 is loopback-only, so"
-    echo "       bounces and sender-address callouts hang instead of failing"
-    echo "       fast. Some receivers reject or greylist for that."
-    echo "    CONSIDER:"
-    echo "      $domain.  IN MX  0 ."
-    echo "    This is a null MX (RFC 7505): 'this domain accepts no mail'."
-    echo "    It PERMANENTLY disables inbound mail for $domain until removed."
+    echo "    Type: MX    Host: @    Priority: 0    Value: ."
+    echo "    Notes:"
+    echo "      * Priority must be exactly 0 and the value exactly a single dot."
+    echo "        Anything else is not a null MX."
+    echo "      * This is RFC 7505: 'this domain accepts no mail'. It PERMANENTLY"
+    echo "        disables inbound mail for $domain until you remove it."
+    echo "      * Why bother: with no MX, receivers fall back to your A record,"
+    echo "        which points at this server - but port 25 is loopback-only, so"
+    echo "        bounces and sender callouts hang instead of failing fast."
+    echo "      * Optional. It does not affect whether your mail is delivered."
   elif [[ "$mx" == "0 ." ]]; then
     echo "    ✅ null MX published - domain correctly declares it accepts no mail"
   else
@@ -1072,17 +1112,12 @@ EOF
     echo ""
     echo "=== New DKIM record for $domain ==="
     echo ""
-    echo "  ${selector}._domainkey.$domain  TXT"
-    echo ""
-    echo "  Web panel - paste as ONE value:"
-    echo ""
-    echo "    $(dkim_record "$dir/$selector.private")"
-    echo ""
-    echo "  BIND zone file:"
-    echo ""
-    echo "  ${selector}._domainkey    IN    TXT    ("
-    printf '%s\n' "$(dkim_record "$dir/$selector.private")" | split_txt
-    echo "  )"
+    echo "[1] DKIM"
+    echo "    Type: TXT    Host: ${selector}._domainkey"
+    paste_value "$(dkim_record "$dir/$selector.private")"
+    echo "    Notes:"
+    echo "      * That is ONE line, however your terminal wraps it."
+    echo "      * Leave the existing ${cur}._domainkey record in place."
     echo ""
     echo "Signing is UNCHANGED - $domain still signs with $cur."
     echo ""
