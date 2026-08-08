@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+Usage:
+  mailctl doctor
+
+Examples:
+  mailctl doctor
+EOF
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# check output helpers
+#
+# fails counts hard failures only. Things that setup has not done yet report
+# as "-" (pending), not as failures, so doctor stays useful before setup runs.
+# ---------------------------------------------------------------------------
+fails=0
+ok()   { printf "  %-34s ✅ %s\n" "$1" "${2:-}"; }
+bad()  { printf "  %-34s ❌ %s\n" "$1" "${2:-}"; fails=$((fails + 1)); }
+warn() { printf "  %-34s ⚠  %s\n" "$1" "${2:-}"; }
+skip() { printf "  %-34s -  %s\n" "$1" "${2:-}"; }
+
+# Public IP as the internet sees it. SPF records hardcode this, so it is the
+# single most important fact on the box.
+public_ip() {
+  local ip=""
+  for url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+    ip="$(curl -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')" || true
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
+  done
+  return 1
+}
+
+# Strip the trailing dot dig puts on names so comparisons work.
+undot() { echo "${1%.}"; }
+
+# Can we open a TCP connection to port 25 somewhere on the internet? Uses the
+# bash /dev/tcp builtin so there is no nc/telnet dependency.
+port25_open() {
+  local hosts=() h
+  if command -v dig >/dev/null 2>&1; then
+    while IFS= read -r h; do
+      [[ -n "$h" ]] && hosts+=("$(undot "$h")")
+    done < <(dig +short mx gmail.com 2>/dev/null | awk '{print $2}' | head -n 2)
+  fi
+  # Fallback targets if dig is missing or the lookup failed.
+  ((${#hosts[@]})) || hosts=(gmail-smtp-in.l.google.com aspmx.l.google.com)
+
+  for h in "${hosts[@]}"; do
+    if timeout 5 bash -c "exec 3<>/dev/tcp/$h/25" 2>/dev/null; then
+      echo "$h"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+
+cmd="${1:-}"
+[[ -n "${cmd}" ]] || { usage; exit 1; }
+
+case "$cmd" in
+  doctor)
+    echo "== mailctl doctor =="
+    echo ""
+    echo "Infrastructure (cannot be fixed by mailctl):"
+
+    # --- outbound port 25 -------------------------------------------------
+    # The gate. Most VPS providers block this by default; GCP blocks it
+    # permanently with no exception. Everything else is moot if this fails.
+    if reached="$(port25_open)"; then
+      ok "Outbound TCP :25" "reachable ($reached)"
+      port25=yes
+    else
+      bad "Outbound TCP :25" "BLOCKED"
+      port25=no
+    fi
+
+    # --- public IP --------------------------------------------------------
+    if ip="$(public_ip)"; then
+      if ip -4 addr show 2>/dev/null | grep -qF " $ip/"; then
+        ok "Public IP" "$ip (bound locally)"
+      else
+        # Common and fine on VPSes that NAT, but SPF still needs the public one.
+        ok "Public IP" "$ip (not bound locally - NAT?)"
+      fi
+    else
+      ip=""
+      bad "Public IP" "could not determine"
+    fi
+
+    # --- PTR / forward-confirmed reverse DNS ------------------------------
+    ptr=""
+    if [[ -z "$ip" ]]; then
+      skip "Reverse DNS (PTR)" "no public IP"
+      skip "Forward-confirmed (FCrDNS)" ""
+    elif ! command -v dig >/dev/null 2>&1; then
+      skip "Reverse DNS (PTR)" "dig not installed"
+      skip "Forward-confirmed (FCrDNS)" ""
+    else
+      ptr="$(undot "$(dig +short -x "$ip" 2>/dev/null | head -n 1)")"
+      if [[ -z "$ptr" ]]; then
+        bad "Reverse DNS (PTR)" "not set - set it at your VPS provider"
+        skip "Forward-confirmed (FCrDNS)" "no PTR"
+      else
+        ok "Reverse DNS (PTR)" "$ptr"
+        fwd="$(dig +short A "$ptr" 2>/dev/null | head -n 1)"
+        if [[ "$fwd" == "$ip" ]]; then
+          ok "Forward-confirmed (FCrDNS)" "$ptr -> $ip"
+        else
+          bad "Forward-confirmed (FCrDNS)" "$ptr -> ${fwd:-<none>}, expected $ip"
+        fi
+      fi
+    fi
+
+    echo ""
+    echo "Mail services:"
+
+    # --- packages ---------------------------------------------------------
+    have_postfix=no
+    have_opendkim=no
+    command -v postfix  >/dev/null 2>&1 && have_postfix=yes
+    command -v opendkim >/dev/null 2>&1 && have_opendkim=yes
+
+    if [[ "$have_postfix" == yes && "$have_opendkim" == yes ]]; then
+      ok "Packages" "postfix + opendkim installed"
+    else
+      missing=""
+      [[ "$have_postfix"  == no ]] && missing="postfix"
+      [[ "$have_opendkim" == no ]] && missing="${missing:+$missing }opendkim"
+      skip "Packages" "not installed: $missing"
+    fi
+
+    # --- service state ----------------------------------------------------
+    for svc in postfix opendkim; do
+      var="have_$svc"
+      if [[ "${!var}" == no ]]; then
+        skip "$svc" "not installed"
+        continue
+      fi
+      state="stopped"
+      systemctl is-active --quiet "$svc" 2>/dev/null && state="active"
+      enabled="disabled"
+      systemctl is-enabled --quiet "$svc" 2>/dev/null && enabled="enabled"
+      if [[ "$state" == active && "$enabled" == enabled ]]; then
+        ok "$svc" "active (enabled)"
+      elif [[ "$state" == active ]]; then
+        bad "$svc" "active but NOT enabled - will not survive reboot"
+      else
+        bad "$svc" "$state ($enabled)"
+      fi
+    done
+
+    echo ""
+    echo "Not an open relay:"
+
+    # --- :25 must be loopback-only ---------------------------------------
+    if [[ "$have_postfix" == no ]]; then
+      skip "Listener :25" "postfix not installed"
+    elif ! command -v ss >/dev/null 2>&1; then
+      skip "Listener :25" "ss not installed"
+    else
+      listeners="$(ss -ltnH '( sport = :25 )' 2>/dev/null | awk '{print $4}' | sort -u)"
+      if [[ -z "$listeners" ]]; then
+        bad "Listener :25" "nothing listening"
+      elif echo "$listeners" | grep -qE '^(0\.0\.0\.0|\[?::\]?):25$'; then
+        bad "Listener :25" "OPEN TO THE INTERNET ($(echo "$listeners" | tr '\n' ' '))"
+      else
+        ok "Listener :25" "$(echo "$listeners" | tr '\n' ' ')"
+      fi
+    fi
+
+    # --- opendkim milter socket ------------------------------------------
+    if [[ "$have_opendkim" == no ]]; then
+      skip "Listener :8891" "opendkim not installed"
+    elif ! command -v ss >/dev/null 2>&1; then
+      skip "Listener :8891" "ss not installed"
+    else
+      dkl="$(ss -ltnH '( sport = :8891 )' 2>/dev/null | awk '{print $4}' | sort -u)"
+      if [[ -z "$dkl" ]]; then
+        skip "Listener :8891" "not listening (setup not run?)"
+      elif echo "$dkl" | grep -qE '^(0\.0\.0\.0|\[?::\]?):8891$'; then
+        bad "Listener :8891" "bound to all interfaces ($(echo "$dkl" | tr '\n' ' '))"
+      else
+        ok "Listener :8891" "$(echo "$dkl" | tr '\n' ' ')"
+      fi
+    fi
+
+    # --- submission / smtps must never be enabled -------------------------
+    if [[ "$have_postfix" == no ]]; then
+      skip "submission/smtps" "postfix not installed"
+    else
+      if enabled_svc="$(postconf -M 2>/dev/null | grep -E '^(submission|smtps)/inet' || true)" \
+         && [[ -n "$enabled_svc" ]]; then
+        bad "submission/smtps" "ENABLED - public submission ports must stay off"
+      else
+        ok "submission/smtps" "not enabled"
+      fi
+    fi
+
+    echo ""
+    echo "Deliverability:"
+
+    # --- root alias must leave the box ------------------------------------
+    # Without this, every bounce and Postfix error notice rots in
+    # /var/mail/root on a box nobody reads mail on.
+    if [[ ! -f /etc/aliases ]]; then
+      skip "root alias" "/etc/aliases not present"
+    else
+      root_target="$(grep -E '^root:' /etc/aliases 2>/dev/null | head -n 1 | cut -d: -f2- | tr -d '[:space:]' || true)"
+      if [[ -z "$root_target" ]]; then
+        bad "root alias" "not set - bounces will be lost"
+      elif [[ "$root_target" != *@* ]]; then
+        bad "root alias" "'$root_target' is local - use an external mailbox"
+      else
+        ok "root alias" "$root_target"
+      fi
+    fi
+
+    # --- queue depth ------------------------------------------------------
+    # A growing deferred queue is the earliest symptom of every mail problem.
+    if [[ "$have_postfix" == no ]]; then
+      skip "Mail queue" "postfix not installed"
+    else
+      qcount="$(postqueue -p 2>/dev/null | grep -cE '^[0-9A-F]{6,}[*!]?' || true)"
+      qcount="${qcount:-0}"
+      if (( qcount == 0 )); then
+        ok "Mail queue" "empty"
+      elif (( qcount < 10 )); then
+        warn "Mail queue" "$qcount message(s) queued"
+      else
+        bad "Mail queue" "$qcount messages queued - check: postqueue -p"
+      fi
+    fi
+
+    echo ""
+    if (( fails > 0 )); then
+      echo "❌ $fails check(s) failed."
+      if [[ "$port25" == no ]]; then
+        echo ""
+        echo "Outbound port 25 is blocked. This is the one blocker mailctl cannot"
+        echo "work around. Most VPS providers block it by default and will open it"
+        echo "on request; Google Cloud blocks it permanently with no exception."
+        echo ""
+        echo "Next steps:"
+        echo "  1. Open a support ticket asking to unblock outbound TCP 25"
+        echo "  2. If they refuse, your only options are a relay host or a"
+        echo "     different provider - self-hosted delivery is not possible here"
+      fi
+      exit 1
+    fi
+
+    echo "✅ All checks passed."
+    ;;
+
+  *)
+    usage
+    exit 1
+    ;;
+esac
