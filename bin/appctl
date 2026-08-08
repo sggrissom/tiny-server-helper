@@ -21,6 +21,17 @@ EOF
 
 die() { echo "Error: $*" >&2; exit 1; }
 
+# Which unit template runs this app. Checks enabled as well as active so a
+# stopped service still resolves to the right type.
+svctype_for() {
+  if systemctl is-active  --quiet "internal@$1" 2>/dev/null \
+  || systemctl is-enabled --quiet "internal@$1" 2>/dev/null; then
+    echo internal
+  else
+    echo app
+  fi
+}
+
 cmd="${1:-}"
 [[ -n "${cmd}" ]] || { usage; exit 1; }
 
@@ -101,7 +112,10 @@ EOF
   logs)
     app="${2:-}"
     [[ -n "$app" ]] || die "missing <app_name>"
-    exec journalctl -u "app@$app" -f
+    # Follow both templates rather than detecting one: only whichever exists
+    # produces output, and this still works for a service that is neither
+    # active nor enabled but has history in the journal.
+    exec journalctl -u "app@$app" -u "internal@$app" -f
     ;;
 
   rollback)
@@ -129,7 +143,7 @@ EOF
     echo "Rolling back $app: $current_release -> $prev_release"
 
     ln -sfn "$releases_dir/$prev_release" "$current"
-    systemctl restart "app@$app"
+    systemctl restart "$(svctype_for "$app")@$app"
 
     echo "Rollback complete. Now running: $prev_release"
     ;;
