@@ -18,7 +18,11 @@ Examples:
 An app is registered for backup by writing /srv/apps/<app>/shared/backup.conf.
 Deploying an app does not enable backups; this is opt-in, the way mail is.
 
-Not implemented yet (see back-plan.md sections 4-6):
+setup installs and enables $RUN_TIMER (nightly 03:00, jittered):
+  systemctl list-timers $RUN_TIMER
+  journalctl -u backupctl.service -g FAILED
+
+Not implemented yet (see back-plan.md sections 5-6):
   status, check, list, fetch, forget
 EOF
 }
@@ -29,6 +33,22 @@ TSH_DIR="/etc/tiny-server-helper"
 BACKUP_ENV="$TSH_DIR/backup.env"
 APPS_DIR="/srv/apps"
 STATE_DIR="/var/lib/tiny-server-helper/backup"
+
+SYSTEMD_DIR="/etc/systemd/system"
+# The timer units call backupctl by absolute path, so a unit file that is static
+# in git needs one agreed location. This is the only path in the repo that
+# assumes where backupctl is installed.
+BIN_LINK="/usr/local/bin/backupctl"
+RUN_TIMER="backupctl.timer"
+CHECK_TIMER="backupctl-check.timer"
+UNITS=(backupctl.service backupctl.timer backupctl-check.service backupctl-check.timer)
+
+# `backupctl check` is not implemented yet (back-plan.md section 5). Its units
+# ship now so the pair lands together, but setup does not enable the timer:
+# a nightly unit that fails only because the command prints usage would be
+# indistinguishable from a real broken backup, which is the whole thing this
+# tool is trying not to do. Flip to yes when check lands.
+CHECK_IMPLEMENTED=no
 
 # Staging is a fixed path, not mktemp -d, on purpose. restic locates the parent
 # snapshot by matching the backup's path list, so a path that changes every run
@@ -95,6 +115,83 @@ install_file() {
 require_setup() {
   [[ -f "$BACKUP_ENV" ]] \
     || die "backups are not set up yet - run: sudo backupctl setup <restic_repo_url>"
+}
+
+# ---------------------------------------------------------------------------
+# scheduling
+#
+# The unit files live in the repo's systemd/ next to app@.service rather than in
+# a heredoc here, so they are reviewed as unit files and bootstrap-vps's
+# "cp systemd/<unit> /etc/systemd/system/" shape carries over. setup installs
+# them, the way mailctl setup installs its drop-ins, because a backup tool you
+# have to remember to schedule is a backup tool that stops running the week you
+# forget.
+# ---------------------------------------------------------------------------
+
+# This script's real path, following the /usr/local/bin symlink, and the repo
+# root above bin/.
+self_path()  { readlink -f "${BASH_SOURCE[0]}"; }
+units_dir()  { echo "$(dirname "$(dirname "$(self_path)")")/systemd"; }
+
+unit_prop() { systemctl show "$1" -p "$2" --value 2>/dev/null; }
+
+# Is <unit> installed under /etc/systemd/system?
+unit_installed() { [[ -f "$SYSTEMD_DIR/$1" ]]; }
+
+install_units() {
+  local src u changed=no
+  src="$(units_dir)"
+
+  for u in "${UNITS[@]}"; do
+    if [[ ! -f "$src/$u" ]]; then
+      echo "⚠  Cannot install timers: $src/$u not found."
+      echo "   backupctl looks for its unit files next to itself, in the repo's"
+      echo "   systemd/ directory. Backups will work when run by hand, but"
+      echo "   nothing is scheduled. Install them from a checkout:"
+      echo "     sudo cp systemd/backupctl*.{service,timer} $SYSTEMD_DIR/"
+      echo "     sudo systemctl daemon-reload"
+      echo "     sudo systemctl enable --now $RUN_TIMER"
+      return 1
+    fi
+  done
+
+  # The units' ExecStart is an absolute path, so it has to exist. A symlink
+  # rather than a copy, so editing the checkout is what changes what runs -
+  # a stale copy in /usr/local/bin that quietly differs from the repo is a
+  # nasty thing to debug at 3am, which is precisely when this runs.
+  if [[ ! -e "$BIN_LINK" ]]; then
+    ln -s "$(self_path)" "$BIN_LINK"
+    echo "Linked $BIN_LINK -> $(self_path)"
+  elif [[ "$(readlink -f "$BIN_LINK")" != "$(self_path)" ]]; then
+    echo "⚠  $BIN_LINK already exists and points at $(readlink -f "$BIN_LINK"),"
+    echo "   not $(self_path). Leaving it alone - the timer will run that copy."
+  fi
+
+  for u in "${UNITS[@]}"; do
+    if ! cmp -s "$src/$u" "$SYSTEMD_DIR/$u"; then
+      install_file "$SYSTEMD_DIR/$u" root:root 0644 <"$src/$u"
+      echo "Installed $SYSTEMD_DIR/$u"
+      changed=yes
+    fi
+  done
+  [[ "$changed" == yes ]] && systemctl daemon-reload
+
+  # enable --now starts the timer, not the backup: a timer's "start" only arms
+  # it. The first actual run is tonight, or `sudo backupctl run` right now.
+  systemctl enable --now "$RUN_TIMER" >/dev/null 2>&1 \
+    || { echo "⚠  Could not enable $RUN_TIMER - check: systemctl status $RUN_TIMER"; return 1; }
+  echo "Enabled $RUN_TIMER ($(unit_prop "$RUN_TIMER" NextElapseUSecRealtime))"
+
+  if [[ "$CHECK_IMPLEMENTED" == yes ]]; then
+    systemctl enable --now "$CHECK_TIMER" >/dev/null 2>&1 \
+      || { echo "⚠  Could not enable $CHECK_TIMER"; return 1; }
+    echo "Enabled $CHECK_TIMER ($(unit_prop "$CHECK_TIMER" NextElapseUSecRealtime))"
+  else
+    echo "Installed $CHECK_TIMER but did NOT enable it: 'backupctl check' is not"
+    echo "  written yet (back-plan.md section 5). Nothing warns you if backups"
+    echo "  stop working - watch: journalctl -u backupctl.service -g FAILED"
+  fi
+  return 0
 }
 
 # Load repository credentials into the environment for restic.
@@ -580,6 +677,63 @@ case "$cmd" in
       ok "Staging space" "${free_mb}MB free on $stage_check_dir"
     fi
 
+    # --- scheduling -------------------------------------------------------
+    # "Nothing is scheduled" is the same class of failure as "nothing is
+    # registered": every other check passes and no backup happens.
+    echo ""
+    echo "Scheduling:"
+
+    if [[ ! -e "$BIN_LINK" && "$have_env" == no ]]; then
+      # Pre-setup this is pending, not broken: setup creates the link. doctor
+      # stays a preflight you can run on a box where nothing exists yet.
+      skip "$BIN_LINK" "not linked yet (setup not run?)"
+    elif [[ ! -e "$BIN_LINK" ]]; then
+      bad "$BIN_LINK" "missing - the timer's ExecStart does not exist"
+    elif [[ "$(readlink -f "$BIN_LINK")" != "$(self_path)" ]]; then
+      warn "$BIN_LINK" "-> $(readlink -f "$BIN_LINK"), not this script ($(self_path))"
+    else
+      ok "$BIN_LINK" "-> $(self_path)"
+    fi
+
+    if ! unit_installed "$RUN_TIMER"; then
+      if [[ "$have_env" == no ]]; then
+        skip "$RUN_TIMER" "not installed (setup not run?)"
+      else
+        bad "$RUN_TIMER" "not installed - nothing is scheduled; re-run setup"
+      fi
+    elif [[ "$(systemctl is-enabled "$RUN_TIMER" 2>/dev/null)" != enabled ]]; then
+      bad "$RUN_TIMER" "installed but not enabled - fix: sudo systemctl enable --now $RUN_TIMER"
+    elif [[ "$(systemctl is-active "$RUN_TIMER" 2>/dev/null)" != active ]]; then
+      bad "$RUN_TIMER" "enabled but not active - fix: sudo systemctl start $RUN_TIMER"
+    else
+      ok "$RUN_TIMER" "next: $(unit_prop "$RUN_TIMER" NextElapseUSecRealtime)"
+    fi
+
+    # The last run's verdict. run already logs a greppable FAILED line, but a
+    # unit that has never run at all is the case doctor is here to surface.
+    if unit_installed backupctl.service; then
+      last_trigger="$(unit_prop "$RUN_TIMER" LastTriggerUSec)"
+      svc_result="$(unit_prop backupctl.service Result)"
+      svc_status="$(unit_prop backupctl.service ExecMainStatus)"
+      if [[ -z "$last_trigger" || "$last_trigger" == "n/a" ]]; then
+        warn "backupctl.service" "the timer has never fired it yet"
+      elif [[ "$svc_result" == success && "$svc_status" == 0 ]]; then
+        ok "backupctl.service" "last run $last_trigger, exit 0"
+      else
+        bad "backupctl.service" "last run $last_trigger ended $svc_result (exit $svc_status) - journalctl -u backupctl.service -g FAILED"
+      fi
+    fi
+
+    if [[ "$CHECK_IMPLEMENTED" == yes ]]; then
+      if [[ "$(systemctl is-enabled "$CHECK_TIMER" 2>/dev/null)" == enabled ]]; then
+        ok "$CHECK_TIMER" "next: $(unit_prop "$CHECK_TIMER" NextElapseUSecRealtime)"
+      else
+        bad "$CHECK_TIMER" "not enabled - nothing would tell you backups went stale"
+      fi
+    else
+      warn "$CHECK_TIMER" "not enabled - 'backupctl check' is unimplemented (back-plan.md 5)"
+    fi
+
     echo ""
     echo "Registered apps:"
 
@@ -754,8 +908,17 @@ EOF
       fi
     fi
 
+    # --- scheduling --------------------------------------------------------
+    # After the repository is known to open, so a box never ends up with an
+    # armed nightly timer pointed at a repository that was never initialised.
+    echo ""
+    echo "Scheduling..."
+    sched_ok=yes
+    install_units || sched_ok=no
+
     echo ""
     echo "✅ Setup complete."
+    [[ "$sched_ok" == yes ]] || echo "   (with scheduling incomplete - see above)"
     echo ""
     echo "Next steps:"
     echo "  1. Confirm the repository password is stored off this box."
@@ -769,10 +932,13 @@ EOF
     echo "  3. Verify what backupctl sees:  backupctl doctor"
     echo "  4. Take one by hand:            sudo backupctl run <app>"
     echo ""
-    echo "  Nightly scheduling, staleness alerting, and retention are not"
-    echo "  implemented yet (back-plan.md sections 4-6). Until they are, this"
-    echo "  repository grows without bound and nothing warns you if a run"
-    echo "  stops working."
+    echo "  Backups now run nightly at 03:00 (+ up to 30m jitter):"
+    echo "     systemctl list-timers $RUN_TIMER"
+    echo "     journalctl -u backupctl.service -n 50"
+    echo ""
+    echo "  Staleness alerting and retention are not implemented yet"
+    echo "  (back-plan.md sections 5-6). Until they are, this repository grows"
+    echo "  without bound and nothing warns you if a run stops working."
     ;;
 
   run)

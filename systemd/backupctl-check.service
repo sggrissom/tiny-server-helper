@@ -1,0 +1,20 @@
+[Unit]
+Description=Alert if any registered app's newest backup is stale (backupctl check)
+
+[Service]
+Type=oneshot
+User=root
+
+# Exits non-zero and emails when a registered app has no successful backup
+# newer than 48h - including an app that has never had one. Separate from
+# backupctl.service on purpose: the thing that reports a broken backup must not
+# be the thing that broke.
+ExecStart=/usr/local/bin/backupctl check
+
+Nice=10
+
+# Mail goes to the local Postfix on 127.0.0.1:25, so this is bounded by that,
+# not by the network.
+TimeoutStartSec=300
+
+# No [Install] section - started by backupctl-check.timer. See backupctl.service.

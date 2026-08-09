@@ -1,0 +1,35 @@
+[Unit]
+Description=Back up every registered app (backupctl run)
+# A remote restic backend needs the network up; a local repository does not.
+# Wanting network-online costs nothing on a local repo and avoids a confusing
+# DNS failure on the first night after the repository moves off-box.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+
+# backupctl exits non-zero on any app's failure and logs a fixed, greppable
+# "backupctl: FAILED app=<app> reason=<slug>" line, so a failed unit and a
+# journal grep say the same thing:
+#   systemctl status backupctl.service
+#   journalctl -u backupctl.service -g FAILED
+ExecStart=/usr/local/bin/backupctl run
+
+# Apps share this box with the backup, and a nightly restic scan should never be
+# what makes a request slow.
+Nice=10
+IOSchedulingClass=idle
+
+# A hung run must not still be holding the per-app lock and the repository lock
+# at tomorrow's window. The snapshot fetch is already bounded by backupctl's own
+# curl timeout; this bounds restic.
+#
+# If a run is ever killed here, restic may leave a stale lock in the repository.
+# It expires on its own, or `restic unlock` clears it once backup.env is loaded.
+TimeoutStartSec=3600
+
+# Deliberately no [Install] section. This unit is started by backupctl.timer,
+# and a WantedBy=multi-user.target here would also run a full backup at every
+# boot, which is not what "enable the nightly backup" should mean.

@@ -1,0 +1,21 @@
+[Unit]
+Description=Nightly backup of every registered app
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+
+# Spread the start, so eight apps' snapshot endpoints and one restic repository
+# are not all hit on the same second across however many boxes run this.
+RandomizedDelaySec=1800
+
+# Without this, a box that is off or rebooting across the window silently skips
+# that night, and a silently skipped night is the failure this tool exists to
+# prevent. With it, the run happens on the next boot instead.
+#
+# The catch-up run is subject to RandomizedDelaySec too, which is also what
+# keeps a boot-time catch-up from racing the app@ units it needs to answer on
+# loopback. A run that still loses that race fails loudly and retries tomorrow.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

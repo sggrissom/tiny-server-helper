@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily staleness check of app backups
+
+[Timer]
+# Well after the 03:00 backup window plus its randomised delay, so a check never
+# reports on a run that is still in progress.
+OnCalendar=*-*-* 09:00:00
+RandomizedDelaySec=900
+
+# A box that was off across 09:00 was also off across the backup window, which
+# is exactly when the staleness check has something to say.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
