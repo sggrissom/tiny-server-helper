@@ -10,7 +10,8 @@ Usage:
 
 Examples:
   backupctl doctor
-  sudo backupctl setup b2:my-bucket:tsh
+  sudo backupctl setup /var/backups/restic   # local disk
+  sudo backupctl setup b2:my-bucket:tsh      # or any restic repo URL
   sudo backupctl run
   sudo backupctl run family
 
