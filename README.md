@@ -13,6 +13,7 @@ bin/appctl          server-side app management
 bin/bootstrap-vps   one-time server setup
 bin/deploy          local deploy script
 bin/mailctl         server-side outbound mail (Postfix + DKIM)
+bin/backupctl       server-side backups (restic), opt-in per app
 bin/monitor         one-off / watch health check
 systemd/            app@ and internal@ unit templates
 monitor-tui/        terminal dashboard for all sites
@@ -172,6 +173,88 @@ and never enter git.** There is no export path; if you lose them, rotate.
 If OpenDKIM is down, Postfix returns `451 4.7.1` and the app's send fails
 loudly rather than mail leaving unsigned and quietly eroding the sending
 reputation shared by every domain on the box.
+
+## Backups
+
+Server-level capability, opt-in per app, using [restic](https://restic.net) as
+the engine. Apps own exactly two things — producing a consistent snapshot of
+their own database, and declaring which files matter. Everything else is
+identical for every app and lives here.
+
+**Partially implemented.** `doctor`, `setup`, and `run` work. Scheduling,
+staleness alerting, retention, and restore (`status`, `check`, `list`, `fetch`,
+`forget`) are not written yet — see `back-plan.md` sections 4–6. Until they are,
+runs are manual, the repository grows without bound, and nothing warns you if a
+run stops working.
+
+### Setup
+
+```bash
+backupctl doctor                          # preflight; run before anything else
+sudo backupctl setup b2:my-bucket:tsh     # any restic repo URL
+```
+
+`setup` generates the repository password, writes it to
+`/etc/tiny-server-helper/backup.env` (root, mode 600), prints it once, and
+initialises the repository. If the backend needs credentials, add them to that
+file and re-run `setup` — the password is preserved across re-runs, and `setup`
+will never overwrite an existing `backup.env`.
+
+**The repository password is the whole game.** Lose it and every archive is
+permanently unreadable. It gets the same treatment as the DKIM private keys: one
+copy on the box, one copy somewhere off-box that is not the backup target
+itself.
+
+### Registering an app
+
+Write `/srv/apps/<app>/shared/backup.conf`. Its existence *is* the registration —
+there is no state file, and `rm backup.conf` is a complete deregistration.
+Deploying an app does not enable backups.
+
+```
+snapshot_url=http://127.0.0.1:$PORT/internal/snapshot
+snapshot_name=db.bolt
+snapshot_token_var=BACKUP_TOKEN
+include=static/photos/*_original.*
+```
+
+| key | meaning |
+| --- | --- |
+| `snapshot_url` | Optional. Fetched, body stored as `snapshot_name`. How an app hands over a database snapshot that could not be taken by copying files. `$PORT` comes from the app's `shared/.env`. |
+| `snapshot_name` | Required with `snapshot_url`. A plain filename. |
+| `snapshot_token_var` | Optional. Names a variable in the app's `shared/.env` whose value is sent as `Authorization: Bearer`. The token stays in the app's env file; `backupctl` never stores a copy. |
+| `include` | Repeatable glob, relative to `shared/`. |
+
+There is no `exclude`. An allowlist is the safer default: a forgotten `exclude`
+is a silently bloated archive, a forgotten `include` is a loud missing file at
+restore time.
+
+### Day to day
+
+```bash
+backupctl doctor            # repo opens, configs parse, globs resolve, endpoints answer
+sudo backupctl run          # every registered app
+sudo backupctl run family   # one app
+```
+
+`run` fails loudly and specifically, and never records a success it did not have:
+
+- A **404** from `snapshot_url` is a hard failure, not an empty backup. Apps
+  return 404 for absent or wrong auth precisely so the endpoint is not
+  discoverable, so 404 means "the token is wrong" far more often than "there is
+  no database here."
+- An `include` glob matching **zero files** is a hard failure.
+- An **unknown key** in `backup.conf` is a hard failure. A typo'd `inculde` that
+  silently backs up nothing is the exact failure this tool exists to prevent.
+- `restic` **exit 3** (some source data unreadable) counts as failure. A partial
+  archive recorded as a success is something you discover at restore time.
+- One app's failure never skips the others, and the run still exits non-zero.
+
+Declared files go to restic by path and are never copied; only the database
+snapshot is staged, into a mode-700 directory removed on every exit path.
+
+`deploy` needs no backup awareness and has none: configuration lives in `/etc`
+and in the app's own `shared/`, and neither is touched by a release.
 
 ## Monitoring
 

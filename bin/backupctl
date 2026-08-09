@@ -1,0 +1,811 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+Usage:
+  backupctl doctor
+  backupctl setup <restic_repo_url>
+  backupctl run [<app>]
+
+Examples:
+  backupctl doctor
+  sudo backupctl setup b2:my-bucket:tsh
+  sudo backupctl run
+  sudo backupctl run family
+
+An app is registered for backup by writing /srv/apps/<app>/shared/backup.conf.
+Deploying an app does not enable backups; this is opt-in, the way mail is.
+
+Not implemented yet (see back-plan.md sections 4-6):
+  status, check, list, fetch, forget
+EOF
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+TSH_DIR="/etc/tiny-server-helper"
+BACKUP_ENV="$TSH_DIR/backup.env"
+APPS_DIR="/srv/apps"
+STATE_DIR="/var/lib/tiny-server-helper/backup"
+
+# Staging is a fixed path, not mktemp -d, on purpose. restic locates the parent
+# snapshot by matching the backup's path list, so a path that changes every run
+# means every run rescans from scratch. Fixed path + mode 700 + trap cleanup
+# gets the same secrecy as a temp dir without defeating incremental backup.
+STAGE_ROOT="$STATE_DIR/stage"
+
+# The snapshot endpoint holds a read tx for its whole duration, so this is a
+# ceiling on how long an app's database is pinned, not just a network timeout.
+SNAPSHOT_TIMEOUT=300
+SNAPSHOT_CONNECT_TIMEOUT=5
+
+# Free space required under $STATE_DIR to stage a database snapshot. The photo
+# tree is handed to restic by path and never copied, so staging only ever holds
+# one database snapshot.
+STAGE_FREE_BAD_MB=512
+STAGE_FREE_WARN_MB=2048
+
+# ---------------------------------------------------------------------------
+# check output helpers
+#
+# Same contract as mailctl: fails counts hard failures only, and things setup
+# has not done yet report as "-" (pending), so doctor stays useful before setup
+# has ever run.
+# ---------------------------------------------------------------------------
+fails=0
+ok()   { printf "  %-34s ✅ %s\n" "$1" "${2:-}"; }
+bad()  { printf "  %-34s ❌ %s\n" "$1" "${2:-}"; fails=$((fails + 1)); }
+warn() { printf "  %-34s ⚠  %s\n" "$1" "${2:-}"; }
+skip() { printf "  %-34s -  %s\n" "$1" "${2:-}"; }
+
+# run's output goes to the journal under a timer, so every line is prefixed and
+# failures carry a fixed, greppable shape: "backupctl: FAILED app=<app> ...".
+log()  { printf 'backupctl: %s\n' "$*"; }
+failed() { printf 'backupctl: FAILED app=%s %s\n' "$1" "$2" >&2; }
+
+need_root() { [[ "$(id -u)" -eq 0 ]] || die "$1 must run as root (use sudo)"; }
+
+# Follows bootstrap-vps on caddy and mailctl on postfix: detect, print the
+# install line, do not install. No package manager, no distro detection.
+require_restic() {
+  command -v restic >/dev/null 2>&1 && return 0
+  echo "NOTE: missing: restic"
+  echo "Install, then re-run:"
+  echo "  sudo apt-get install -y restic"
+  echo ""
+  echo "Debian/Ubuntu ship restic in the default repos. If the packaged version"
+  echo "is older than 0.14, prefer the upstream release binary - the repository"
+  echo "format is compatible, but older clients lack 'restic forget --prune'."
+  exit 1
+}
+
+# Write a file atomically, then set owner and mode. mktemp lands in the target
+# directory so the mv cannot cross filesystems.
+install_file() {
+  local dest="$1" owner="$2" mode="$3" tmp
+  tmp="$(mktemp "$(dirname "$dest")/.backupctl.XXXXXX")"
+  cat >"$tmp"
+  chown "$owner" "$tmp"
+  chmod "$mode" "$tmp"
+  mv "$tmp" "$dest"
+}
+
+require_setup() {
+  [[ -f "$BACKUP_ENV" ]] \
+    || die "backups are not set up yet - run: sudo backupctl setup <restic_repo_url>"
+}
+
+# Load repository credentials into the environment for restic.
+#
+# This sources a file, so it refuses to run unless the file is root-owned and
+# mode 600 - the same reason doctor checks the mode. A 644 backup.env is both a
+# leaked repository password and a file any local user could have edited into
+# arbitrary root-run shell.
+load_backup_env() {
+  local mode owner
+  require_setup
+  mode="$(stat -c '%a' "$BACKUP_ENV")"
+  owner="$(stat -c '%U' "$BACKUP_ENV")"
+  [[ "$owner" == root ]] || die "$BACKUP_ENV must be owned by root (is: $owner)"
+  [[ "$mode" == 600 ]]   || die "$BACKUP_ENV must be mode 600 (is: $mode) - fix: sudo chmod 600 $BACKUP_ENV"
+  set -a
+  # shellcheck disable=SC1090
+  . "$BACKUP_ENV"
+  set +a
+  [[ -n "${RESTIC_REPOSITORY:-}" ]] || die "RESTIC_REPOSITORY is not set in $BACKUP_ENV"
+  [[ -n "${RESTIC_PASSWORD:-}" ]]   || die "RESTIC_PASSWORD is not set in $BACKUP_ENV"
+}
+
+# ---------------------------------------------------------------------------
+# app registry
+#
+# The filesystem is the registry, exactly as /etc/opendkim/keys/<domain>/ is
+# for mailctl. An app is registered for backup iff its shared/backup.conf
+# exists. There is no state file to drift, and `rm backup.conf` is a complete
+# deregistration.
+#
+# /var/lib/tiny-server-helper/backup/<app>.last is a cache for status and
+# check, not the registry - it stays derivable from `restic snapshots`.
+# ---------------------------------------------------------------------------
+registered_apps() {
+  local d
+  [[ -d "$APPS_DIR" ]] || return 0
+  for d in "$APPS_DIR"/*/; do
+    [[ -f "$d/shared/backup.conf" ]] || continue
+    basename "$d"
+  done
+}
+
+# Epoch of the last successful backup, or empty.
+last_success() {
+  local f="$STATE_DIR/$1.last"
+  [[ -f "$f" ]] || return 1
+  tr -dc '0-9' <"$f"
+}
+
+human_age() {
+  local secs="$1"
+  if (( secs < 3600 )); then echo "$((secs / 60))m ago"
+  elif (( secs < 172800 )); then echo "$((secs / 3600))h ago"
+  else echo "$((secs / 86400))d ago"
+  fi
+}
+
+# PORT for an app, read the same way appctl domain reads it (bin/appctl:172).
+app_port() {
+  local envfile="$APPS_DIR/$1/shared/.env" port
+  [[ -f "$envfile" ]] || return 1
+  port="$(grep -E '^PORT=' "$envfile" | head -n 1 | cut -d= -f2)"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  (( port >= 1 && port <= 65535 )) || return 1
+  echo "$port"
+}
+
+# Value of <var> in the app's shared/.env. The token stays in the app's env
+# file; backupctl reads it per run and never stores a copy of it.
+app_env_value() {
+  local envfile="$APPS_DIR/$1/shared/.env" val
+  [[ -f "$envfile" ]] || return 1
+  val="$(grep -E "^$2=" "$envfile" | head -n 1 | cut -d= -f2-)"
+  [[ -n "$val" ]] || return 1
+  # Strip one layer of surrounding quotes, which systemd's EnvironmentFile
+  # accepts and operators therefore write.
+  val="${val%\"}"; val="${val#\"}"
+  val="${val%\'}"; val="${val#\'}"
+  echo "$val"
+}
+
+# ---------------------------------------------------------------------------
+# backup.conf parsing
+#
+# A hand-rolled parser rather than sourcing the file, for two reasons: unknown
+# keys must be a loud error (a typo'd `inculde` that silently backs up nothing
+# is the exact failure this tool exists to prevent), and backup.conf is app
+# configuration that should not be able to execute as root.
+#
+# Results land in globals; conf_error carries the message so doctor can report
+# every app's parse result instead of dying on the first bad one.
+# ---------------------------------------------------------------------------
+conf_snapshot_url=""
+conf_snapshot_name=""
+conf_snapshot_token_var=""
+conf_includes=()
+conf_error=""
+
+parse_conf() {
+  local app="$1" conf="$APPS_DIR/$app/shared/backup.conf"
+  local line key val lineno=0 port=""
+
+  conf_snapshot_url=""
+  conf_snapshot_name=""
+  conf_snapshot_token_var=""
+  conf_includes=()
+  conf_error=""
+
+  [[ -f "$conf" ]] || { conf_error="no backup.conf at $conf"; return 1; }
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lineno=$((lineno + 1))
+    line="${line%%$'\r'}"
+    # Strip surrounding whitespace.
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "$line" == '#'* ]] && continue
+
+    [[ "$line" == *=* ]] || { conf_error="line $lineno: not key=value: $line"; return 1; }
+    key="${line%%=*}"
+    val="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"
+    val="${val#"${val%%[![:space:]]*}"}"
+
+    case "$key" in
+      snapshot_url)
+        [[ -z "$conf_snapshot_url" ]] || { conf_error="line $lineno: snapshot_url set twice"; return 1; }
+        conf_snapshot_url="$val"
+        ;;
+      snapshot_name)
+        [[ -z "$conf_snapshot_name" ]] || { conf_error="line $lineno: snapshot_name set twice"; return 1; }
+        conf_snapshot_name="$val"
+        ;;
+      snapshot_token_var)
+        [[ -z "$conf_snapshot_token_var" ]] || { conf_error="line $lineno: snapshot_token_var set twice"; return 1; }
+        conf_snapshot_token_var="$val"
+        ;;
+      include)
+        [[ -n "$val" ]] || { conf_error="line $lineno: empty include"; return 1; }
+        conf_includes+=("$val")
+        ;;
+      *)
+        conf_error="line $lineno: unknown key '$key' (expected snapshot_url, snapshot_name, snapshot_token_var, or include)"
+        return 1
+        ;;
+    esac
+  done <"$conf"
+
+  # --- snapshot_url ------------------------------------------------------
+  if [[ -n "$conf_snapshot_url" ]]; then
+    if [[ "$conf_snapshot_url" == *'$PORT'* ]]; then
+      port="$(app_port "$app")" \
+        || { conf_error="snapshot_url uses \$PORT but no valid PORT= in $APPS_DIR/$app/shared/.env"; return 1; }
+      conf_snapshot_url="${conf_snapshot_url//\$PORT/$port}"
+    fi
+    # Only $PORT is interpolated. Leaving any other $VAR to reach curl as a
+    # literal turns an operator's wrong assumption into a confusing URL error.
+    [[ "$conf_snapshot_url" == *'$'* ]] \
+      && { conf_error="snapshot_url contains an uninterpolated variable - only \$PORT is substituted: $conf_snapshot_url"; return 1; }
+    [[ "$conf_snapshot_url" =~ ^https?:// ]] \
+      || { conf_error="snapshot_url must be http:// or https://: $conf_snapshot_url"; return 1; }
+
+    [[ -n "$conf_snapshot_name" ]] \
+      || { conf_error="snapshot_url is set but snapshot_name is not - the fetched body needs a name in the archive"; return 1; }
+  elif [[ -n "$conf_snapshot_name" ]]; then
+    conf_error="snapshot_name is set but snapshot_url is not"
+    return 1
+  elif [[ -n "$conf_snapshot_token_var" ]]; then
+    conf_error="snapshot_token_var is set but snapshot_url is not"
+    return 1
+  fi
+
+  # --- snapshot_name must be one plain filename --------------------------
+  if [[ -n "$conf_snapshot_name" ]]; then
+    case "$conf_snapshot_name" in
+      */*|.|..) conf_error="snapshot_name must be a plain filename, not a path: $conf_snapshot_name"; return 1 ;;
+    esac
+  fi
+
+  if [[ -n "$conf_snapshot_token_var" ]]; then
+    [[ "$conf_snapshot_token_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+      || { conf_error="snapshot_token_var is not a valid variable name: $conf_snapshot_token_var"; return 1; }
+  fi
+
+  # --- include patterns --------------------------------------------------
+  # Textual checks only; expand_includes re-checks after resolution, which is
+  # what catches a symlink out of shared/.
+  local pat
+  for pat in ${conf_includes[@]+"${conf_includes[@]}"}; do
+    [[ "$pat" == /* ]] && { conf_error="include must be relative to shared/: $pat"; return 1; }
+    case "/$pat/" in
+      */../*) conf_error="include may not contain '..': $pat"; return 1 ;;
+    esac
+  done
+
+  if [[ -z "$conf_snapshot_url" ]] && ((${#conf_includes[@]} == 0)); then
+    conf_error="backup.conf declares nothing to back up (no snapshot_url, no include)"
+    return 1
+  fi
+  return 0
+}
+
+# Expand include globs relative to shared/, into the `expanded` array of
+# absolute paths. A glob matching zero files is a hard failure: the failure
+# mode of a forgotten include is a loud missing file at restore time, and this
+# is where that noise belongs.
+expanded=()
+expand_includes() {
+  local app="$1" shared="$APPS_DIR/$app/shared"
+  local shared_real pat m full real
+  expanded=()
+  ((${#conf_includes[@]})) || return 0
+
+  shared_real="$(realpath "$shared")" || { conf_error="cannot resolve $shared"; return 1; }
+
+  for pat in "${conf_includes[@]}"; do
+    local -a matches=()
+    # $pat is deliberately unquoted so it globs. IFS is cleared in the subshell
+    # so it still globs but does not word-split, which would silently turn one
+    # include containing a space into two wrong patterns.
+    while IFS= read -r -d '' m; do
+      [[ -n "$m" ]] && matches+=("$m")
+    done < <(cd "$shared" && IFS='' && shopt -s nullglob dotglob && printf '%s\0' $pat)
+
+    ((${#matches[@]})) \
+      || { conf_error="include matched no files: $pat (relative to $shared)"; return 1; }
+
+    for m in "${matches[@]}"; do
+      full="$shared/$m"
+      real="$(realpath -e "$full" 2>/dev/null)" \
+        || { conf_error="include match disappeared while resolving: $m"; return 1; }
+      # After resolution, so a symlink pointing out of shared/ is caught.
+      [[ "$real" == "$shared_real" || "$real" == "$shared_real"/* ]] \
+        || { conf_error="include escapes shared/: $m -> $real"; return 1; }
+      # restic --files-from is line-delimited.
+      [[ "$real" == *$'\n'* ]] \
+        && { conf_error="include match contains a newline, which restic --files-from cannot express: $m"; return 1; }
+      expanded+=("$real")
+    done
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# snapshot fetch
+# ---------------------------------------------------------------------------
+# Fetch <url> to <dest>. Echoes the HTTP status. The token, when there is one,
+# goes to curl through a config file on stdin rather than as an argument, so it
+# never appears in this process's argv where any local user could read it.
+fetch_snapshot() {
+  local url="$1" dest="$2" token="${3:-}" code rc cfg=""
+
+  if [[ -n "$token" ]]; then
+    # curl's config format is quoted; a token containing these would be
+    # silently mangled into a wrong header rather than rejected.
+    case "$token" in
+      *'"'*|*'\'*|*$'\n'*) echo "TOKEN_UNQUOTABLE"; return 1 ;;
+    esac
+    cfg="header = \"Authorization: Bearer $token\""$'\n'
+  fi
+
+  # curl exits 18 on a short transfer, and the snapshot endpoint sets
+  # Content-Length, so a truncated body is a curl error rather than a silently
+  # short archive.
+  if code="$(printf '%s' "$cfg" | curl -K - \
+      --silent --show-error \
+      --connect-timeout "$SNAPSHOT_CONNECT_TIMEOUT" \
+      --max-time "$SNAPSHOT_TIMEOUT" \
+      --output "$dest" \
+      --write-out '%{http_code}' \
+      "$url" 2>/dev/null)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  echo "${code:-000}"
+  return $rc
+}
+
+# ---------------------------------------------------------------------------
+# run
+# ---------------------------------------------------------------------------
+# Back up one app. Returns non-zero on any failure, after logging a line that
+# says which app and why. Never returns 0 having skipped anything.
+run_app() {
+  local app="$1"
+  local shared="$APPS_DIR/$app/shared"
+  local stage="$STAGE_ROOT/$app"
+  local started
+  started="$(date +%s)"
+
+  [[ -d "$APPS_DIR/$app" ]] || { failed "$app" "reason=no-such-app"; return 1; }
+
+  if ! parse_conf "$app"; then
+    failed "$app" "reason=bad-config detail=$conf_error"
+    return 1
+  fi
+
+  # A second run on the same app would share the staging directory and race the
+  # app's own concurrent-snapshot guard (which answers 409). Fail loudly instead
+  # of producing whichever archive wins.
+  exec 9>"$STATE_DIR/$app.lock"
+  if ! flock -n 9; then
+    failed "$app" "reason=already-running detail=another backupctl run holds $STATE_DIR/$app.lock"
+    return 1
+  fi
+
+  # Staged data is a plaintext database and private files. Mode 700, removed on
+  # every exit path including failure. rm -rf first clears anything a killed
+  # previous run left behind.
+  rm -rf "$stage"
+  mkdir -p "$stage"
+  chmod 700 "$stage"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$stage'" RETURN
+
+  local -a paths=()
+
+  # --- database snapshot -------------------------------------------------
+  if [[ -n "$conf_snapshot_url" ]]; then
+    local token="" code rc=0
+    if [[ -n "$conf_snapshot_token_var" ]]; then
+      if ! token="$(app_env_value "$app" "$conf_snapshot_token_var")"; then
+        failed "$app" "reason=no-token detail=$conf_snapshot_token_var is unset or empty in $shared/.env"
+        return 1
+      fi
+    fi
+
+    log "$app: fetching snapshot $conf_snapshot_url -> $conf_snapshot_name"
+    if code="$(fetch_snapshot "$conf_snapshot_url" "$stage/$conf_snapshot_name" "$token")"; then
+      rc=0
+    else
+      rc=$?
+    fi
+
+    if [[ "$code" == TOKEN_UNQUOTABLE ]]; then
+      failed "$app" "reason=bad-token detail=$conf_snapshot_token_var contains a quote, backslash, or newline"
+      return 1
+    fi
+    if (( rc != 0 )); then
+      failed "$app" "reason=snapshot-transport curl_exit=$rc http=$code url=$conf_snapshot_url"
+      return 1
+    fi
+    case "$code" in
+      200) ;;
+      404)
+        # The app-side design returns 404 for absent or mismatched auth
+        # precisely so the endpoint is not discoverable. Treating it as "no
+        # database to back up" would turn a misconfigured token into a
+        # successful, empty backup - the exact silent failure this tool exists
+        # to prevent.
+        failed "$app" "reason=snapshot-404 detail=endpoint absent OR ${conf_snapshot_token_var:-token} wrong/unset - 404 is what the app returns for bad auth url=$conf_snapshot_url"
+        return 1
+        ;;
+      409)
+        failed "$app" "reason=snapshot-409 detail=app reports a snapshot already in progress url=$conf_snapshot_url"
+        return 1
+        ;;
+      *)
+        failed "$app" "reason=snapshot-http http=$code url=$conf_snapshot_url"
+        return 1
+        ;;
+    esac
+    if [[ ! -s "$stage/$conf_snapshot_name" ]]; then
+      failed "$app" "reason=snapshot-empty detail=HTTP 200 with an empty body url=$conf_snapshot_url"
+      return 1
+    fi
+    log "$app: snapshot ok $(stat -c '%s' "$stage/$conf_snapshot_name") bytes"
+    paths+=("$stage/$conf_snapshot_name")
+  fi
+
+  # --- declared files ----------------------------------------------------
+  # Passed to restic by their real paths rather than copied into staging: a
+  # photo tree is gigabytes, and stable paths are what let restic find the
+  # parent snapshot and read only what changed.
+  if ! expand_includes "$app"; then
+    failed "$app" "reason=bad-include detail=$conf_error"
+    return 1
+  fi
+  if ((${#expanded[@]})); then
+    log "$app: ${#expanded[@]} file(s) from ${#conf_includes[@]} include pattern(s)"
+    paths+=("${expanded[@]}")
+  fi
+
+  ((${#paths[@]})) || { failed "$app" "reason=nothing-to-back-up"; return 1; }
+
+  # --- restic ------------------------------------------------------------
+  local listfile="$stage/.files"
+  printf '%s\n' "${paths[@]}" >"$listfile"
+
+  log "$app: restic backup (${#paths[@]} path(s))"
+  local out rc2=0
+  # No --no-scan or other recent flags here on purpose: Debian 12 ships restic
+  # 0.14, and an unknown flag would turn every nightly run into a hard failure.
+  if out="$(restic backup \
+      --files-from "$listfile" \
+      --tag "app=$app" \
+      2>&1)"; then
+    rc2=0
+  else
+    rc2=$?
+  fi
+  [[ -n "$out" ]] && printf '%s\n' "$out" | sed "s/^/backupctl: $app: restic: /"
+
+  # restic exits 3 when some source data could not be read. That is a partial
+  # archive, and a partial archive recorded as a success is how you find out at
+  # restore time. Only 0 counts.
+  if (( rc2 != 0 )); then
+    failed "$app" "reason=restic-backup restic_exit=$rc2"
+    return 1
+  fi
+
+  # Written only after restic reported success, so the cache can never claim a
+  # backup that did not happen.
+  install_file "$STATE_DIR/$app.last" root:root 0644 <<<"$(date +%s)"
+
+  log "$app: OK in $(( $(date +%s) - started ))s"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+
+cmd="${1:-}"
+[[ -n "${cmd}" ]] || { usage; exit 1; }
+
+case "$cmd" in
+  doctor)
+    echo "== backupctl doctor =="
+    echo ""
+    echo "Engine:"
+
+    require_restic
+    ok "restic" "$(restic version 2>/dev/null | head -n 1)"
+
+    # --- credentials file -------------------------------------------------
+    have_env=no
+    if [[ ! -f "$BACKUP_ENV" ]]; then
+      skip "$BACKUP_ENV" "not present (setup not run?)"
+    else
+      env_mode="$(stat -c '%a' "$BACKUP_ENV")"
+      env_owner="$(stat -c '%U' "$BACKUP_ENV")"
+      if [[ "$env_mode" == 600 && "$env_owner" == root ]]; then
+        ok "$BACKUP_ENV" "root:600"
+        have_env=yes
+      else
+        bad "$BACKUP_ENV" "$env_owner:$env_mode - must be root:600 (holds the repository password)"
+      fi
+    fi
+
+    # --- repository -------------------------------------------------------
+    # One check covers reachability and credential validity: opening the repo
+    # config requires the network, the backend credentials, and the password.
+    if [[ "$have_env" == no ]]; then
+      skip "Repository" "no credentials file"
+    elif [[ "$(id -u)" -ne 0 ]]; then
+      skip "Repository" "re-run as root to read $BACKUP_ENV"
+    else
+      load_backup_env
+      if repo_out="$(restic cat config 2>&1)"; then
+        ok "Repository" "$RESTIC_REPOSITORY (opens, version $(printf '%s' "$repo_out" | jq -r '.version' 2>/dev/null || echo '?'))"
+      else
+        bad "Repository" "$RESTIC_REPOSITORY will not open"
+        printf '%s\n' "$repo_out" | sed 's/^/      /'
+      fi
+    fi
+
+    # --- staging space ----------------------------------------------------
+    # Staging only ever holds one database snapshot; declared files go to
+    # restic by path and are never copied.
+    stage_check_dir="$STATE_DIR"
+    while [[ ! -d "$stage_check_dir" && "$stage_check_dir" != / ]]; do
+      stage_check_dir="$(dirname "$stage_check_dir")"
+    done
+    free_mb="$(df -Pm "$stage_check_dir" 2>/dev/null | awk 'NR==2{print $4}')"
+    if [[ -z "$free_mb" ]]; then
+      warn "Staging space" "could not determine free space on $stage_check_dir"
+    elif (( free_mb < STAGE_FREE_BAD_MB )); then
+      bad "Staging space" "${free_mb}MB free on $stage_check_dir (need >${STAGE_FREE_BAD_MB}MB)"
+    elif (( free_mb < STAGE_FREE_WARN_MB )); then
+      warn "Staging space" "${free_mb}MB free on $stage_check_dir"
+    else
+      ok "Staging space" "${free_mb}MB free on $stage_check_dir"
+    fi
+
+    echo ""
+    echo "Registered apps:"
+
+    any=no
+    while IFS= read -r app; do
+      [[ -n "$app" ]] || continue
+      any=yes
+
+      if ! parse_conf "$app"; then
+        bad "$app: backup.conf" "$conf_error"
+        continue
+      fi
+
+      detail="${#conf_includes[@]} include(s)"
+      [[ -n "$conf_snapshot_url" ]] && detail="snapshot + $detail"
+      ok "$app: backup.conf" "$detail"
+
+      # Glob resolution, which is where a wrong path or a symlink out of
+      # shared/ shows up.
+      if ! expand_includes "$app"; then
+        bad "$app: includes" "$conf_error"
+      elif ((${#expanded[@]})); then
+        ok "$app: includes" "${#expanded[@]} file(s) resolved"
+      fi
+
+      # The snapshot endpoint. Worth the bytes over loopback: a 404 here is a
+      # backup that would silently contain no database, and finding that in
+      # doctor beats finding it at restore time.
+      if [[ -z "$conf_snapshot_url" ]]; then
+        skip "$app: snapshot endpoint" "no snapshot_url"
+      elif [[ "$(id -u)" -ne 0 ]]; then
+        skip "$app: snapshot endpoint" "re-run as root to read the token"
+      else
+        tok=""
+        tok_ok=yes
+        if [[ -n "$conf_snapshot_token_var" ]]; then
+          tok="$(app_env_value "$app" "$conf_snapshot_token_var")" || tok_ok=no
+        fi
+        if [[ "$tok_ok" == no ]]; then
+          bad "$app: snapshot endpoint" "$conf_snapshot_token_var unset/empty in shared/.env"
+        else
+          if hc="$(fetch_snapshot "$conf_snapshot_url" /dev/null "$tok")"; then crc=0; else crc=$?; fi
+          case "$hc" in
+            200) ok   "$app: snapshot endpoint" "HTTP 200" ;;
+            404) bad  "$app: snapshot endpoint" "HTTP 404 - endpoint absent or token wrong (the app 404s bad auth)" ;;
+            409) warn "$app: snapshot endpoint" "HTTP 409 - a snapshot is in progress right now" ;;
+            *)   bad  "$app: snapshot endpoint" "HTTP $hc (curl exit $crc)" ;;
+          esac
+        fi
+      fi
+
+      # Cheap, and the one number that says whether any of this is working.
+      if ls_epoch="$(last_success "$app")" && [[ -n "$ls_epoch" ]]; then
+        ok "$app: last success" "$(human_age "$(( $(date +%s) - ls_epoch ))")"
+      else
+        warn "$app: last success" "never - no successful backup recorded"
+      fi
+    done < <(registered_apps)
+
+    [[ "$any" == yes ]] \
+      || skip "(none)" "write /srv/apps/<app>/shared/backup.conf to register one"
+
+    echo ""
+    if (( fails > 0 )); then
+      echo "❌ $fails check(s) failed."
+      exit 1
+    fi
+    echo "✅ All checks passed."
+    ;;
+
+  setup)
+    need_root setup
+    repo="${2:-}"
+    [[ -n "$repo" ]] || die "missing <restic_repo_url>"
+    require_restic
+
+    echo "== backupctl setup =="
+    echo "  Repository: $repo"
+    echo ""
+
+    mkdir -p "$TSH_DIR"
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+
+    # backup.env holds the repository password, and losing it makes every
+    # existing archive unreadable. Setup will not overwrite it, ever - not even
+    # to "re-run setup with the same repo". Changing repositories is a
+    # deliberate edit of this file by a human who knows what the old password
+    # was for.
+    if [[ -f "$BACKUP_ENV" ]]; then
+      echo "$BACKUP_ENV already exists - leaving it alone."
+      echo ""
+      echo "It holds the password for whatever repository it names. Overwriting"
+      echo "it would make every existing archive unreadable, so setup never"
+      echo "does. To point at a different repository, edit it by hand after"
+      echo "saving the current password somewhere off this box."
+      echo ""
+      current_repo="$(grep -E '^RESTIC_REPOSITORY=' "$BACKUP_ENV" | head -n 1 | cut -d= -f2- || true)"
+      [[ -n "$current_repo" ]] && echo "  Currently: $current_repo"
+      [[ "$current_repo" == "$repo" ]] || echo "  Requested: $repo  (NOT applied)"
+    else
+      pass="$(openssl rand -base64 32)" || die "could not generate a repository password (is openssl installed?)"
+      install_file "$BACKUP_ENV" root:root 0600 <<EOF
+# Managed by backupctl. Mode 600, root-owned, never in git.
+#
+# RESTIC_PASSWORD is the whole game: lose it and every archive in the
+# repository is permanently unreadable. It gets the same treatment as the DKIM
+# private keys - one copy here, one copy somewhere off this box that is not the
+# backup target itself.
+RESTIC_REPOSITORY=$repo
+RESTIC_PASSWORD=$pass
+
+# Backend credentials, if the repository needs them. restic reads these from
+# the environment; add whichever pair matches your backend and re-run setup.
+#   Backblaze B2:      B2_ACCOUNT_ID=  B2_ACCOUNT_KEY=
+#   S3-compatible:     AWS_ACCESS_KEY_ID=  AWS_SECRET_ACCESS_KEY=
+#   Azure:             AZURE_ACCOUNT_NAME=  AZURE_ACCOUNT_KEY=
+#   SFTP / local path: none needed
+EOF
+      echo "Wrote $BACKUP_ENV (root:600)"
+      echo ""
+      echo "  === SAVE THIS PASSWORD OFF THIS BOX, NOW ==="
+      echo ""
+      echo "    +--- copy the line below, and nothing else ----------------"
+      printf '%s\n' "$pass"
+      echo "    +----------------------------------------------------------"
+      echo ""
+      echo "  Without it, every archive in $repo is unreadable. Store it"
+      echo "  somewhere that is not this server and not the backup target."
+      echo ""
+    fi
+
+    load_backup_env
+
+    # --- initialise the repository ----------------------------------------
+    echo "Checking repository..."
+    if restic cat config >/dev/null 2>&1; then
+      echo "✅ Repository already initialised: $RESTIC_REPOSITORY"
+    else
+      # Distinguish "empty, needs init" from "credentials missing or wrong".
+      # Running init against an unreachable backend produces a confusing error
+      # and, worse, running it against a repository that exists but whose
+      # password is wrong fails in a way that reads like a network problem.
+      echo "Repository does not open yet - trying restic init..."
+      if init_out="$(restic init 2>&1)"; then
+        echo "✅ Repository initialised: $RESTIC_REPOSITORY"
+      else
+        printf '%s\n' "$init_out" | sed 's/^/  /'
+        echo ""
+        echo "restic could not initialise $RESTIC_REPOSITORY."
+        echo ""
+        echo "If that error mentions credentials or authorization, add the"
+        echo "backend credentials to $BACKUP_ENV and re-run:"
+        echo "  sudo backupctl setup $repo"
+        echo ""
+        echo "The password already written to that file is preserved across"
+        echo "re-runs, so this is safe to repeat."
+        exit 1
+      fi
+    fi
+
+    echo ""
+    echo "✅ Setup complete."
+    echo ""
+    echo "Next steps:"
+    echo "  1. Confirm the repository password is stored off this box."
+    echo "  2. Register an app by writing its backup.conf, e.g.:"
+    echo "       sudo -u apps tee /srv/apps/<app>/shared/backup.conf <<'EOF'"
+    echo "       snapshot_url=http://127.0.0.1:\$PORT/internal/snapshot"
+    echo "       snapshot_name=db.bolt"
+    echo "       snapshot_token_var=BACKUP_TOKEN"
+    echo "       include=static/photos/*_original.*"
+    echo "       EOF"
+    echo "  3. Verify what backupctl sees:  backupctl doctor"
+    echo "  4. Take one by hand:            sudo backupctl run <app>"
+    echo ""
+    echo "  Nightly scheduling, staleness alerting, and retention are not"
+    echo "  implemented yet (back-plan.md sections 4-6). Until they are, this"
+    echo "  repository grows without bound and nothing warns you if a run"
+    echo "  stops working."
+    ;;
+
+  run)
+    need_root run
+    require_restic
+    load_backup_env
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    mkdir -p "$STAGE_ROOT"
+    chmod 700 "$STAGE_ROOT"
+    # Belt and braces with run_app's RETURN trap. RETURN does not fire when the
+    # shell exits, so an unexpected `set -e` death mid-run would otherwise leave
+    # a plaintext database on disk.
+    trap 'rm -rf "$STAGE_ROOT"' EXIT
+
+    app="${2:-}"
+    if [[ -n "$app" ]]; then
+      [[ -f "$APPS_DIR/$app/shared/backup.conf" ]] \
+        || die "$app is not registered for backup (no $APPS_DIR/$app/shared/backup.conf)"
+      run_app "$app"
+      exit $?
+    fi
+
+    # Every registered app. One app's failure must not skip the others - a
+    # broken app that silently prevented every other backup would be a much
+    # worse outage than the one it started as.
+    total=0
+    failures=0
+    while IFS= read -r a; do
+      [[ -n "$a" ]] || continue
+      total=$((total + 1))
+      run_app "$a" || failures=$((failures + 1))
+    done < <(registered_apps)
+
+    if (( total == 0 )); then
+      log "no apps registered for backup - write /srv/apps/<app>/shared/backup.conf"
+      exit 0
+    fi
+    if (( failures > 0 )); then
+      log "FAILED $failures of $total app(s)"
+      exit 1
+    fi
+    log "OK $total app(s)"
+    ;;
+
+  *)
+    usage
+    exit 1
+    ;;
+esac
