@@ -190,9 +190,17 @@ run stops working.
 ### Setup
 
 ```bash
-backupctl doctor                          # preflight; run before anything else
-sudo backupctl setup b2:my-bucket:tsh     # any restic repo URL
+backupctl doctor                            # preflight; run before anything else
+sudo backupctl setup /var/backups/restic    # local disk
+sudo backupctl setup b2:my-bucket:tsh       # or any restic repo URL
 ```
+
+A local path is the easy start and covers the common losses — a bad migration, a
+bug deleting rows, a botched deploy — but shares a disk with the data it
+protects, so it does nothing for losing the box. `restic copy` relocates the
+whole history to a remote repo later; init that repo with
+`--from-repo <local> --copy-chunker-params` so deduplication matches, which can
+only be set at init time.
 
 `setup` generates the repository password, writes it to
 `/etc/tiny-server-helper/backup.env` (root, mode 600), prints it once, and

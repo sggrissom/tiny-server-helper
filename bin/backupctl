@@ -647,7 +647,20 @@ case "$cmd" in
       echo "❌ $fails check(s) failed."
       exit 1
     fi
-    echo "✅ All checks passed."
+
+    # "All checks passed" on a box where nothing is registered is exactly the
+    # silence that looks like success this tool exists to prevent - every check
+    # legitimately passes because there is nothing to check. Still exit 0:
+    # doctor is a preflight meant to be run *before* setup, same as mailctl's.
+    if [[ "$have_env" == no ]]; then
+      echo "⚠  Checks passed, but NOTHING IS BEING BACKED UP - no repository yet."
+      echo "   Next: sudo backupctl setup <restic_repo_url>"
+    elif [[ "$any" == no ]]; then
+      echo "⚠  Checks passed, but NOTHING IS BEING BACKED UP - no app is registered."
+      echo "   Next: write /srv/apps/<app>/shared/backup.conf"
+    else
+      echo "✅ All checks passed."
+    fi
     ;;
 
   setup)
