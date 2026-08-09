@@ -1,0 +1,16 @@
+[Unit]
+Description=Weekly backup retention and prune
+
+[Timer]
+# Sunday 04:30, well clear of the 03:00 backup window plus its 30m jitter.
+# Weekly rather than nightly because prune is the expensive operation here and
+# the retention policy is measured in days and weeks, not hours.
+OnCalendar=Sun *-*-* 04:30:00
+RandomizedDelaySec=1800
+
+# The repository sits on the same disk as the data it protects, so a box that
+# was off for a week must still bound its own growth on the next boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

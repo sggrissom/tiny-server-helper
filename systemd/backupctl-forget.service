@@ -1,0 +1,25 @@
+[Unit]
+Description=Apply backup retention and prune the repository (backupctl forget)
+Wants=network-online.target
+After=network-online.target
+
+# Never while a backup is running. prune takes an exclusive repository lock, and
+# the timers are hours apart anyway; this is for the case where a backup is
+# still running late or catching up after a reboot.
+Conflicts=backupctl.service
+After=backupctl.service
+
+[Service]
+Type=oneshot
+User=root
+
+ExecStart=/usr/local/bin/backupctl forget
+
+Nice=10
+IOSchedulingClass=idle
+
+# prune rewrites repository index and pack files. On a repository this size it
+# is minutes, but it is the one operation here worth giving real room.
+TimeoutStartSec=7200
+
+# No [Install] section - started by backupctl-forget.timer. See backupctl.service.

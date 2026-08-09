@@ -7,6 +7,11 @@ Usage:
   backupctl doctor
   backupctl setup <restic_repo_url>
   backupctl run [<app>]
+  backupctl status
+  backupctl check [--test]
+  backupctl list <app>
+  backupctl fetch <app> <snapshot_id|latest> <dest_dir>
+  backupctl forget [--dry-run]
 
 Examples:
   backupctl doctor
@@ -14,16 +19,23 @@ Examples:
   sudo backupctl setup b2:my-bucket:tsh      # or any restic repo URL
   sudo backupctl run
   sudo backupctl run family
+  sudo backupctl status
+  sudo backupctl check --test                # prove alerts reach you
+  sudo backupctl list family
+  sudo backupctl fetch family latest /var/tmp/restore-family
+  sudo backupctl forget --dry-run
 
 An app is registered for backup by writing /srv/apps/<app>/shared/backup.conf.
 Deploying an app does not enable backups; this is opt-in, the way mail is.
 
-setup installs and enables $RUN_TIMER (nightly 03:00, jittered):
-  systemctl list-timers $RUN_TIMER
+setup installs and enables the timers that make this run on its own:
+  $RUN_TIMER          nightly 03:00, jittered
+  $FORGET_TIMER   weekly, retention + prune
+  $CHECK_TIMER    daily, alert if any backup is older than 48h
+  systemctl list-timers 'backupctl*'
   journalctl -u backupctl.service -g FAILED
 
-Not implemented yet (see back-plan.md sections 5-6):
-  status, check, list, fetch, forget
+Alerts need ALERT_EMAIL set in $BACKUP_ENV.
 EOF
 }
 
@@ -31,6 +43,10 @@ die() { echo "Error: $*" >&2; exit 1; }
 
 TSH_DIR="/etc/tiny-server-helper"
 BACKUP_ENV="$TSH_DIR/backup.env"
+# Written by mailctl setup. Read only for MAIL_HOSTNAME, to send alerts from the
+# domain that already has SPF and DKIM set up rather than from a bare hostname
+# that every receiver is entitled to distrust.
+MAIL_ENV="$TSH_DIR/mail.env"
 APPS_DIR="/srv/apps"
 STATE_DIR="/var/lib/tiny-server-helper/backup"
 
@@ -40,15 +56,21 @@ SYSTEMD_DIR="/etc/systemd/system"
 # assumes where backupctl is installed.
 BIN_LINK="/usr/local/bin/backupctl"
 RUN_TIMER="backupctl.timer"
+FORGET_TIMER="backupctl-forget.timer"
 CHECK_TIMER="backupctl-check.timer"
-UNITS=(backupctl.service backupctl.timer backupctl-check.service backupctl-check.timer)
+UNITS=(backupctl.service backupctl.timer
+       backupctl-forget.service backupctl-forget.timer
+       backupctl-check.service backupctl-check.timer)
 
-# `backupctl check` is not implemented yet (back-plan.md section 5). Its units
-# ship now so the pair lands together, but setup does not enable the timer:
-# a nightly unit that fails only because the command prints usage would be
-# indistinguishable from a real broken backup, which is the whole thing this
-# tool is trying not to do. Flip to yes when check lands.
-CHECK_IMPLEMENTED=no
+# An app whose newest successful backup is older than this is stale. Two
+# missed nightly windows rather than one, so a single failed night that the
+# next night fixes does not page anyone.
+STALE_SECONDS=$((48 * 3600))
+
+# Postfix's sendmail. Preferred over speaking SMTP to 127.0.0.1:25 by hand: it
+# is the same local Postfix either way, and this gets queuing and retry instead
+# of a bash SMTP dialogue that fails the moment the daemon is briefly busy.
+SENDMAIL="/usr/sbin/sendmail"
 
 # Staging is a fixed path, not mktemp -d, on purpose. restic locates the parent
 # snapshot by matching the backup's path list, so a path that changes every run
@@ -60,6 +82,17 @@ STAGE_ROOT="$STATE_DIR/stage"
 # ceiling on how long an app's database is pinned, not just a network timeout.
 SNAPSHOT_TIMEOUT=300
 SNAPSHOT_CONNECT_TIMEOUT=5
+
+# Retention, applied per app tag by `forget`.
+#
+# --keep-last 1 is not in the plan's "keep-daily 7, keep-weekly 4" and is there
+# on purpose: without it, an app whose backups broke six weeks ago loses its
+# last surviving archive the moment it ages past the weekly window. Retention
+# deleting the only copy you have left, precisely because nothing was watching,
+# is the worst outcome this tool could produce.
+KEEP_LAST=1
+KEEP_DAILY=7
+KEEP_WEEKLY=4
 
 # Free space required under $STATE_DIR to stage a database snapshot. The photo
 # tree is handed to restic by path and never copied, so staging only ever holds
@@ -138,6 +171,27 @@ unit_prop() { systemctl show "$1" -p "$2" --value 2>/dev/null; }
 # Is <unit> installed under /etc/systemd/system?
 unit_installed() { [[ -f "$SYSTEMD_DIR/$1" ]]; }
 
+# doctor's report on one timer. <consequence> is what silently stops happening
+# when this particular timer is missing, which is the only part an operator
+# reading the line actually needs. Reads $have_env, which doctor sets first:
+# before setup these are pending, not broken.
+doctor_timer() {
+  local timer="$1" consequence="$2"
+  if ! unit_installed "$timer"; then
+    if [[ "$have_env" == no ]]; then
+      skip "$timer" "not installed (setup not run?)"
+    else
+      bad "$timer" "not installed - $consequence; re-run setup"
+    fi
+  elif [[ "$(systemctl is-enabled "$timer" 2>/dev/null)" != enabled ]]; then
+    bad "$timer" "installed but not enabled ($consequence) - fix: sudo systemctl enable --now $timer"
+  elif [[ "$(systemctl is-active "$timer" 2>/dev/null)" != active ]]; then
+    bad "$timer" "enabled but not active - fix: sudo systemctl start $timer"
+  else
+    ok "$timer" "next: $(unit_prop "$timer" NextElapseUSecRealtime)"
+  fi
+}
+
 install_units() {
   local src u changed=no
   src="$(units_dir)"
@@ -182,15 +236,17 @@ install_units() {
     || { echo "⚠  Could not enable $RUN_TIMER - check: systemctl status $RUN_TIMER"; return 1; }
   echo "Enabled $RUN_TIMER ($(unit_prop "$RUN_TIMER" NextElapseUSecRealtime))"
 
-  if [[ "$CHECK_IMPLEMENTED" == yes ]]; then
-    systemctl enable --now "$CHECK_TIMER" >/dev/null 2>&1 \
-      || { echo "⚠  Could not enable $CHECK_TIMER"; return 1; }
-    echo "Enabled $CHECK_TIMER ($(unit_prop "$CHECK_TIMER" NextElapseUSecRealtime))"
-  else
-    echo "Installed $CHECK_TIMER but did NOT enable it: 'backupctl check' is not"
-    echo "  written yet (back-plan.md section 5). Nothing warns you if backups"
-    echo "  stop working - watch: journalctl -u backupctl.service -g FAILED"
-  fi
+  # Retention is scheduled, not left to a human running `forget`. The
+  # repository shares a 20G disk with every app on the box, so unbounded growth
+  # is an outage for eight apps, and a command nobody remembers to run does not
+  # bound anything.
+  systemctl enable --now "$FORGET_TIMER" >/dev/null 2>&1 \
+    || { echo "⚠  Could not enable $FORGET_TIMER - check: systemctl status $FORGET_TIMER"; return 1; }
+  echo "Enabled $FORGET_TIMER ($(unit_prop "$FORGET_TIMER" NextElapseUSecRealtime))"
+
+  systemctl enable --now "$CHECK_TIMER" >/dev/null 2>&1 \
+    || { echo "⚠  Could not enable $CHECK_TIMER"; return 1; }
+  echo "Enabled $CHECK_TIMER ($(unit_prop "$CHECK_TIMER" NextElapseUSecRealtime))"
   return 0
 }
 
@@ -213,6 +269,51 @@ load_backup_env() {
   set +a
   [[ -n "${RESTIC_REPOSITORY:-}" ]] || die "RESTIC_REPOSITORY is not set in $BACKUP_ENV"
   [[ -n "${RESTIC_PASSWORD:-}" ]]   || die "RESTIC_PASSWORD is not set in $BACKUP_ENV"
+}
+
+# ---------------------------------------------------------------------------
+# alerting
+#
+# Mail goes through the local Postfix that `mailctl setup` already configured.
+# That this repo already owns the mail capability is the whole reason the
+# staleness alert lives here and not in each app.
+#
+# ALERT_EMAIL comes from backup.env. There is no default recipient: guessing
+# root@localhost would produce an alert that is delivered, unread, forever.
+# ---------------------------------------------------------------------------
+alert_from() {
+  local host=""
+  [[ -f "$MAIL_ENV" ]] \
+    && host="$(grep -E '^MAIL_HOSTNAME=' "$MAIL_ENV" | head -n 1 | cut -d= -f2- || true)"
+  [[ -n "$host" ]] || host="$(hostname -f 2>/dev/null || hostname)"
+  echo "backupctl@$host"
+}
+
+# Why alerting cannot work right now, or empty if it can. Used by both doctor
+# and check, so the two never disagree about the state of the alert path.
+alert_blocker() {
+  [[ -n "${ALERT_EMAIL:-}" ]] || { echo "ALERT_EMAIL is not set in $BACKUP_ENV"; return 0; }
+  [[ -x "$SENDMAIL" ]] || { echo "$SENDMAIL is missing - is Postfix installed? (see: mailctl doctor)"; return 0; }
+  echo ""
+}
+
+# send_alert <subject>, body on stdin.
+send_alert() {
+  local subject="$1" blocker
+  blocker="$(alert_blocker)"
+  if [[ -n "$blocker" ]]; then
+    log "ALERT UNDELIVERABLE: $blocker"
+    return 1
+  fi
+  # Auto-Submitted keeps a vacation responder or a bounce from starting a loop
+  # with a mailbox that is only ever written to by a cron-like timer.
+  {
+    printf 'From: %s\n' "$(alert_from)"
+    printf 'To: %s\n' "$ALERT_EMAIL"
+    printf 'Subject: %s\n' "$subject"
+    printf 'Auto-Submitted: auto-generated\n\n'
+    cat
+  } | "$SENDMAIL" -t -i
 }
 
 # ---------------------------------------------------------------------------
@@ -695,19 +796,8 @@ case "$cmd" in
       ok "$BIN_LINK" "-> $(self_path)"
     fi
 
-    if ! unit_installed "$RUN_TIMER"; then
-      if [[ "$have_env" == no ]]; then
-        skip "$RUN_TIMER" "not installed (setup not run?)"
-      else
-        bad "$RUN_TIMER" "not installed - nothing is scheduled; re-run setup"
-      fi
-    elif [[ "$(systemctl is-enabled "$RUN_TIMER" 2>/dev/null)" != enabled ]]; then
-      bad "$RUN_TIMER" "installed but not enabled - fix: sudo systemctl enable --now $RUN_TIMER"
-    elif [[ "$(systemctl is-active "$RUN_TIMER" 2>/dev/null)" != active ]]; then
-      bad "$RUN_TIMER" "enabled but not active - fix: sudo systemctl start $RUN_TIMER"
-    else
-      ok "$RUN_TIMER" "next: $(unit_prop "$RUN_TIMER" NextElapseUSecRealtime)"
-    fi
+    doctor_timer "$RUN_TIMER" "nothing is scheduled"
+    doctor_timer "$FORGET_TIMER" "the repository grows without bound"
 
     # The last run's verdict. run already logs a greppable FAILED line, but a
     # unit that has never run at all is the case doctor is here to surface.
@@ -724,14 +814,28 @@ case "$cmd" in
       fi
     fi
 
-    if [[ "$CHECK_IMPLEMENTED" == yes ]]; then
-      if [[ "$(systemctl is-enabled "$CHECK_TIMER" 2>/dev/null)" == enabled ]]; then
-        ok "$CHECK_TIMER" "next: $(unit_prop "$CHECK_TIMER" NextElapseUSecRealtime)"
-      else
-        bad "$CHECK_TIMER" "not enabled - nothing would tell you backups went stale"
-      fi
+    doctor_timer "$CHECK_TIMER" "nothing tells you backups went stale"
+
+    # The alert path is what is supposed to tell you backups broke, so a broken
+    # alert path must not be the thing that hides one. Checked here rather than
+    # only at alert time, which is far too late to find out.
+    if [[ "$have_env" == no ]]; then
+      skip "Alerting" "no credentials file"
+    elif [[ "$(id -u)" -ne 0 ]]; then
+      skip "Alerting" "re-run as root to read $BACKUP_ENV"
     else
-      warn "$CHECK_TIMER" "not enabled - 'backupctl check' is unimplemented (back-plan.md 5)"
+      blocker="$(alert_blocker)"
+      if [[ -n "$blocker" ]]; then
+        bad "Alerting" "$blocker"
+      else
+        ok "Alerting" "$ALERT_EMAIL via $SENDMAIL (prove it: sudo backupctl check --test)"
+        # Postfix being down does not lose the mail - sendmail queues it - but
+        # it does delay every alert, which is worth knowing before it matters.
+        if command -v systemctl >/dev/null 2>&1 \
+           && [[ "$(systemctl is-active postfix 2>/dev/null)" != active ]]; then
+          warn "Alerting" "postfix is not active - alerts will queue, not send (mailctl doctor)"
+        fi
+      fi
     fi
 
     echo ""
@@ -859,6 +963,13 @@ case "$cmd" in
 RESTIC_REPOSITORY=$repo
 RESTIC_PASSWORD=$pass
 
+# Where staleness alerts go. Set this: without it, 'backupctl check' has nothing
+# to warn, and a backup that quietly stopped working stays quiet. Delivery is
+# through the local Postfix that mailctl setup configures.
+# There is deliberately no default - root@localhost would be delivered, unread,
+# forever.
+ALERT_EMAIL=
+
 # Backend credentials, if the repository needs them. restic reads these from
 # the environment; add whichever pair matches your backend and re-run setup.
 #   Backblaze B2:      B2_ACCOUNT_ID=  B2_ACCOUNT_KEY=
@@ -932,13 +1043,17 @@ EOF
     echo "  3. Verify what backupctl sees:  backupctl doctor"
     echo "  4. Take one by hand:            sudo backupctl run <app>"
     echo ""
-    echo "  Backups now run nightly at 03:00 (+ up to 30m jitter):"
-    echo "     systemctl list-timers $RUN_TIMER"
+    echo "  5. Set ALERT_EMAIL= in $BACKUP_ENV,"
+    echo "     then prove alerts arrive:    sudo backupctl check --test"
+    echo "  6. Prove a restore works:       sudo backupctl fetch <app> latest /var/tmp/r"
+    echo ""
+    echo "  Backups run nightly at 03:00 (+ up to 30m jitter), retention weekly,"
+    echo "  staleness checks daily:"
+    echo "     systemctl list-timers 'backupctl*'"
     echo "     journalctl -u backupctl.service -n 50"
     echo ""
-    echo "  Staleness alerting and retention are not implemented yet"
-    echo "  (back-plan.md sections 5-6). Until they are, this repository grows"
-    echo "  without bound and nothing warns you if a run stops working."
+    echo "  Until ALERT_EMAIL is set, nothing tells you a backup stopped working"
+    echo "  except: journalctl -u backupctl.service -g FAILED"
     ;;
 
   run)
@@ -982,6 +1097,308 @@ EOF
       exit 1
     fi
     log "OK $total app(s)"
+    ;;
+
+  status)
+    need_root status
+    require_restic
+    load_backup_env
+
+    echo "== backupctl status =="
+    echo "  Repository: $RESTIC_REPOSITORY"
+    echo ""
+    printf "  %-16s %-22s %-10s %s\n" "APP" "LAST SUCCESS" "AGE" "SIZE (raw)"
+
+    now="$(date +%s)"
+    any=no
+    while IFS= read -r a; do
+      [[ -n "$a" ]] || continue
+      any=yes
+
+      if ls_epoch="$(last_success "$a")" && [[ -n "$ls_epoch" ]]; then
+        when="$(date -d "@$ls_epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ls_epoch")"
+        age="$(human_age "$(( now - ls_epoch ))")"
+        (( now - ls_epoch > STALE_SECONDS )) && age="$age  STALE"
+      else
+        when="never"
+        age="-"
+      fi
+
+      # Size is best-effort on purpose. Older restic builds reject snapshot
+      # filters on `stats`, and a status command that dies over a cosmetic
+      # column would be worse than one that prints a question mark.
+      size="?"
+      if st="$(restic stats --mode raw-data --tag "app=$a" 2>/dev/null)"; then
+        # Trim leading space only: "148.402 MiB" must keep the space before its
+        # unit, or every size reads as a bare number.
+        size="$(printf '%s' "$st" | grep -i 'total size' | tail -n 1 | cut -d: -f2- | sed 's/^[[:space:]]*//' || true)"
+        [[ -n "$size" ]] || size="?"
+      fi
+
+      printf "  %-16s %-22s %-10s %s\n" "$a" "$when" "$age" "$size"
+    done < <(registered_apps)
+
+    if [[ "$any" == no ]]; then
+      echo "  (no apps registered - write /srv/apps/<app>/shared/backup.conf)"
+    fi
+    echo ""
+    echo "  LAST SUCCESS is the cached time of the last run restic reported as"
+    echo "  successful. To see the archives themselves: backupctl list <app>"
+    ;;
+
+  check)
+    need_root check
+    load_backup_env
+
+    # --test sends an alert unconditionally. The alert path is the thing that is
+    # supposed to tell you backups broke, so being able to prove it works
+    # without first breaking a backup is the point.
+    if [[ "${2:-}" == "--test" ]]; then
+      blocker="$(alert_blocker)"
+      [[ -z "$blocker" ]] || die "alerting is not usable: $blocker"
+      if send_alert "[backupctl] test alert from $(hostname -s 2>/dev/null || hostname)" <<EOF
+This is a test of the backup staleness alert path, sent by:
+
+  backupctl check --test
+
+If you are reading this, a real alert would have reached you too.
+EOF
+      then
+        log "test alert sent to $ALERT_EMAIL"
+        exit 0
+      fi
+      die "sendmail failed - check: journalctl -u postfix -n 50"
+    fi
+
+    now="$(date +%s)"
+    stale=()
+    never=()
+    fresh=0
+    total=0
+
+    while IFS= read -r a; do
+      [[ -n "$a" ]] || continue
+      total=$((total + 1))
+      if ls_epoch="$(last_success "$a")" && [[ -n "$ls_epoch" ]]; then
+        age=$(( now - ls_epoch ))
+        if (( age > STALE_SECONDS )); then
+          stale+=("$a ($(human_age "$age"))")
+        else
+          fresh=$((fresh + 1))
+        fi
+      else
+        # Registered but never successfully backed up. Alerted on separately
+        # because it is the more alarming case and the easier one to miss: an
+        # app that has never worked has no "last success" to look stale.
+        never+=("$a")
+      fi
+    done < <(registered_apps)
+
+    if (( total == 0 )); then
+      # Not a failure. Nothing is registered, so nothing can be stale - and
+      # doctor is where "nothing is being backed up" gets said loudly.
+      log "no apps registered for backup - nothing to check"
+      exit 0
+    fi
+
+    if ((${#stale[@]} == 0 && ${#never[@]} == 0)); then
+      # Healthy, so nothing gets mailed - which is exactly when a broken alert
+      # path goes unnoticed until the day it was supposed to work. Say so now.
+      # Not a failure: backups are fine. doctor is where this is a hard error.
+      blocker="$(alert_blocker)"
+      [[ -n "$blocker" ]] && log "WARNING: backups are current, but alerting is unusable: $blocker"
+      log "OK $fresh of $total app(s) backed up within $((STALE_SECONDS / 3600))h"
+      exit 0
+    fi
+
+    subject="[backupctl] $(( ${#stale[@]} + ${#never[@]} )) app(s) without a recent backup on $(hostname -s 2>/dev/null || hostname)"
+    body="$( {
+      echo "Registered apps whose newest successful backup is missing or older"
+      echo "than $((STALE_SECONDS / 3600)) hours:"
+      echo ""
+      for a in ${never[@]+"${never[@]}"}; do
+        echo "  NEVER  $a - registered, but no successful backup has ever been recorded"
+      done
+      for a in ${stale[@]+"${stale[@]}"}; do
+        echo "  STALE  $a"
+      done
+      echo ""
+      echo "Repository: ${RESTIC_REPOSITORY:-unknown}"
+      echo ""
+      echo "What to look at, on the box:"
+      echo "  journalctl -u backupctl.service -n 100"
+      echo "  journalctl -u backupctl.service -g FAILED"
+      echo "  backupctl doctor"
+      echo "  sudo backupctl run <app>      # take one by hand, watch it fail"
+    } )"
+
+    # Printed as well as mailed, so the journal carries what the alert said and
+    # an undeliverable alert does not also lose the finding.
+    printf '%s\n' "$body" | sed 's/^/backupctl: /'
+
+    send_rc=0
+    printf '%s\n' "$body" | send_alert "$subject" || send_rc=$?
+    (( send_rc == 0 )) && log "alert sent to $ALERT_EMAIL"
+
+    log "FAILED ${#never[@]} app(s) never backed up, ${#stale[@]} stale, of $total"
+    exit 1
+    ;;
+
+  list)
+    need_root list
+    require_restic
+    load_backup_env
+    app="${2:-}"
+    [[ -n "$app" ]] || die "missing <app> - usage: backupctl list <app>"
+
+    # Deliberately not gated on registration. The moment you most need to list
+    # an app's snapshots is after someone removed its backup.conf.
+    [[ -f "$APPS_DIR/$app/shared/backup.conf" ]] \
+      || echo "NOTE: $app is not currently registered for backup; listing its archives anyway." >&2
+
+    # --compact hides the path list, which for an app with a photo tree is
+    # thousands of lines per snapshot.
+    out="$(restic snapshots --tag "app=$app" --compact 2>&1)" || die "restic snapshots failed: $out"
+    printf '%s\n' "$out"
+    if [[ "$out" != *ID* ]]; then
+      echo ""
+      echo "No snapshots tagged app=$app in $RESTIC_REPOSITORY."
+      echo "Either nothing has been backed up yet, or this is the wrong repository."
+      exit 1
+    fi
+    ;;
+
+  fetch)
+    need_root fetch
+    require_restic
+    load_backup_env
+    app="${2:-}"; snap="${3:-}"; dest="${4:-}"
+    [[ -n "$app" && -n "$snap" && -n "$dest" ]] \
+      || die "usage: backupctl fetch <app> <snapshot_id|latest> <dest_dir>"
+
+    # An existing directory with files in it makes "what came out of the
+    # archive" unanswerable, which is the one question a restore has to answer.
+    if [[ -e "$dest" ]]; then
+      [[ -d "$dest" ]] || die "$dest exists and is not a directory"
+      [[ -z "$(ls -A "$dest" 2>/dev/null)" ]] || die "$dest is not empty - restore into a new directory"
+    else
+      mkdir -p "$dest"
+    fi
+    # A restored database and photo tree are as sensitive as the originals.
+    chmod 700 "$dest"
+
+    if [[ "$snap" == latest ]]; then
+      # The tag filter is what makes `latest` mean "latest for this app" rather
+      # than "latest in the repository", which on a shared repo is some other
+      # app's data.
+      log "restoring latest app=$app snapshot into $dest"
+      restic restore latest --tag "app=$app" --target "$dest" \
+        || die "restic restore failed"
+    else
+      # Guard against restoring another app's data through a mistyped ID. Passing
+      # both an ID and a filter makes restic ignore the filter, so the check has
+      # to happen here rather than being handed to restore.
+      found="$(restic snapshots --tag "app=$app" --compact "$snap" 2>&1 || true)"
+      [[ "$found" == *"$snap"* ]] \
+        || die "snapshot $snap is not tagged app=$app (check: backupctl list $app)"
+      log "restoring $snap into $dest"
+      restic restore "$snap" --target "$dest" || die "restic restore failed"
+    fi
+
+    # restic restores absolute paths under the target, so the staged database
+    # lands at a path this tool chose and can therefore point at exactly.
+    echo ""
+    echo "Restored into $dest:"
+    du -sh "$dest" 2>/dev/null | sed 's/^/  /'
+    if parse_conf "$app" && [[ -n "$conf_snapshot_name" ]]; then
+      db="$dest$STAGE_ROOT/$app/$conf_snapshot_name"
+      [[ -f "$db" ]] && echo "  database: $db"
+    fi
+    [[ -d "$dest$APPS_DIR/$app/shared" ]] && echo "  files:    $dest$APPS_DIR/$app/shared/"
+    echo ""
+    echo "This is where backupctl stops. What to do with these files - stopping the"
+    echo "service, swapping the database in, fixing ownership - is app-specific and"
+    echo "belongs in the app's own restore doc."
+    ;;
+
+  forget)
+    need_root forget
+    require_restic
+    load_backup_env
+    dry=no
+    [[ "${2:-}" == "--dry-run" ]] && dry=yes
+
+    echo "== backupctl forget =="
+    echo "  Repository: $RESTIC_REPOSITORY"
+    echo "  Policy:     --keep-last $KEEP_LAST --keep-daily $KEEP_DAILY --keep-weekly $KEEP_WEEKLY (per app)"
+    [[ "$dry" == yes ]] && echo "  DRY RUN:    nothing will be removed"
+    echo ""
+
+    total=0
+    failures=0
+    while IFS= read -r a; do
+      [[ -n "$a" ]] || continue
+      total=$((total + 1))
+
+      # --group-by tags is essential, not cosmetic. restic's default grouping is
+      # host,paths, and this tool's path list contains every declared file - so
+      # adding one photo creates a new group, each group keeps its own 7 daily,
+      # and snapshots pile up forever in groups nothing ever revisits. Every
+      # snapshot for an app carries the same single tag, so grouping by tags is
+      # one group per app, which is what the policy is written against.
+      local_args=(forget --tag "app=$a" --group-by tags
+                  --keep-last "$KEEP_LAST" --keep-daily "$KEEP_DAILY" --keep-weekly "$KEEP_WEEKLY")
+      [[ "$dry" == yes ]] && local_args+=(--dry-run)
+
+      log "$a: applying retention"
+      if out="$(restic "${local_args[@]}" 2>&1)"; then
+        printf '%s\n' "$out" | sed "s/^/backupctl: $a: restic: /"
+      else
+        rc=$?
+        printf '%s\n' "$out" | sed "s/^/backupctl: $a: restic: /" >&2
+        failed "$a" "reason=restic-forget restic_exit=$rc"
+        failures=$((failures + 1))
+      fi
+    done < <(registered_apps)
+
+    if (( total == 0 )); then
+      log "no apps registered for backup - nothing to apply retention to"
+      exit 0
+    fi
+
+    # Snapshots for an app that is no longer registered are left completely
+    # alone. `rm backup.conf` must not start a countdown to deleting that app's
+    # archives - deregistering and discarding history are different decisions,
+    # and only one of them is reversible.
+
+    # prune is repository-wide, so it runs once after every app's forget rather
+    # than per app. Nothing is actually reclaimed from disk until it does.
+    if [[ "$dry" == yes ]]; then
+      echo ""
+      log "dry run - skipping prune (nothing was forgotten, so nothing to reclaim)"
+    elif (( failures > 0 )); then
+      # Pruning after a partial forget is safe, but the disk number it prints
+      # would be read as "retention is working" when it is only partly working.
+      echo ""
+      log "skipping prune because $failures app(s) failed - fix those, then re-run"
+    else
+      echo ""
+      log "pruning repository (reclaims the space the forgets released)"
+      if out="$(restic prune 2>&1)"; then
+        printf '%s\n' "$out" | sed 's/^/backupctl: restic: /'
+      else
+        rc=$?
+        printf '%s\n' "$out" | sed 's/^/backupctl: restic: /' >&2
+        log "FAILED prune restic_exit=$rc"
+        exit 1
+      fi
+    fi
+
+    if (( failures > 0 )); then
+      log "FAILED retention on $failures of $total app(s)"
+      exit 1
+    fi
+    log "OK retention applied to $total app(s)"
     ;;
 
   *)
