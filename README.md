@@ -181,12 +181,6 @@ the engine. Apps own exactly two things — producing a consistent snapshot of
 their own database, and declaring which files matter. Everything else is
 identical for every app and lives here.
 
-**Partially implemented.** `doctor`, `setup`, and `run` work. Scheduling,
-staleness alerting, retention, and restore (`status`, `check`, `list`, `fetch`,
-`forget`) are not written yet — see `back-plan.md` sections 4–6. Until they are,
-runs are manual, the repository grows without bound, and nothing warns you if a
-run stops working.
-
 ### Setup
 
 ```bash
@@ -212,6 +206,61 @@ will never overwrite an existing `backup.env`.
 permanently unreadable. It gets the same treatment as the DKIM private keys: one
 copy on the box, one copy somewhere off-box that is not the backup target
 itself.
+
+### Scheduling
+
+`setup` also installs `systemd/backupctl.{service,timer}`, symlinks
+`/usr/local/bin/backupctl`, and enables the nightly timer — a backup tool you
+have to remember to schedule is one that stops running the week you forget.
+Runs at **03:00 with up to 30 minutes of jitter**, `Persistent=true` so a box
+that was off across the window catches up on boot instead of silently skipping
+a night.
+
+```bash
+systemctl list-timers backupctl.timer
+journalctl -u backupctl.service -n 50
+journalctl -u backupctl.service -g FAILED   # every failure, one line each
+sudo systemctl start backupctl.service      # run tonight's backup now
+```
+
+Three timers, all installed and enabled by `setup`:
+
+| timer | when | what |
+| --- | --- | --- |
+| `backupctl.timer` | nightly 03:00 ±30m | back up every registered app |
+| `backupctl-forget.timer` | weekly, Sun 04:30 | retention + prune |
+| `backupctl-check.timer` | daily 09:00 | alert on anything stale |
+
+`backupctl doctor` reports whether anything is actually scheduled: nothing
+scheduled is the same class of failure as nothing registered — every other check
+passes and no backup happens.
+
+### Alerting
+
+```bash
+sudo backupctl status         # per-app: last success, age, size
+sudo backupctl check          # non-zero + email if anything is stale
+sudo backupctl check --test   # prove the alert path works
+```
+
+Set `ALERT_EMAIL=` in `/etc/tiny-server-helper/backup.env`. There is
+deliberately no default — `root@localhost` would be delivered, unread, forever,
+and `doctor` reports an unset `ALERT_EMAIL` as a hard failure.
+
+Mail goes out through the local Postfix that `mailctl setup` already configured,
+via `/usr/sbin/sendmail` — the same daemon as talking SMTP to `127.0.0.1:25` by
+hand, but with queuing and retry instead of a bash SMTP dialogue. That this repo
+already owns the mail capability is the reason the staleness alert lives here
+and not in every app. The `From:` uses `MAIL_HOSTNAME` from `mailctl`'s
+`mail.env`, so alerts come from the domain that already has SPF and DKIM.
+
+`check` alerts on an app **registered but never successfully backed up**, not
+just on stale ones — an app that has never worked has no "last success" to look
+stale. It also warns when backups are healthy but the alert path is unusable,
+since that is the one moment a broken alerter is invisible.
+
+⚠️ Alerting is only as good as `<app>.last`, which `run` writes solely after
+restic reports success.
 
 ### Registering an app
 
@@ -263,6 +312,69 @@ snapshot is staged, into a mode-700 directory removed on every exit path.
 
 `deploy` needs no backup awareness and has none: configuration lives in `/etc`
 and in the app's own `shared/`, and neither is touched by a release.
+
+### Retention
+
+```bash
+sudo backupctl forget --dry-run   # what retention would remove
+sudo backupctl forget             # apply it, then prune
+```
+
+`--keep-last 1 --keep-daily 7 --keep-weekly 4`, per app, run weekly by
+`backupctl-forget.timer`. Scheduled rather than left to you: the repository
+shares a 20 GB disk with every app on the box, so unbounded growth is an outage
+for all of them, and a command nobody remembers to run bounds nothing.
+
+Three details that are load-bearing:
+
+- **`--group-by tags`.** restic groups by `host,paths` by default, and this
+  tool's path list contains every declared file — so adding one photo would
+  start a new group, each group would keep its own 7 daily, and snapshots would
+  pile up in groups nothing ever revisits. Every snapshot for an app carries the
+  same single tag, so grouping by tags is one group per app, which is what the
+  policy is written against.
+- **`--keep-last 1`** is not in the original policy and is there because an app
+  whose backups broke six weeks ago would otherwise lose its last surviving
+  archive the moment it aged past the weekly window. Retention deleting the only
+  copy left, precisely because nothing was watching, is the worst thing this
+  tool could do.
+- **Deregistered apps are never touched.** `rm backup.conf` must not start a
+  countdown to deleting that app's archives; deregistering and discarding
+  history are different decisions, and only one of them is reversible. Their
+  snapshots stay until a human removes them.
+
+`prune` runs once after every app's `forget`, and is skipped entirely if any app
+failed — a reclaimed-space number printed after a partial run reads as
+"retention is working" when it is only partly working.
+
+### Restoring
+
+```bash
+sudo backupctl list family                              # what's available
+sudo backupctl fetch family latest /var/tmp/restore     # newest
+sudo backupctl fetch family abc1234 /var/tmp/restore    # a specific snapshot
+```
+
+`fetch` requires an empty or nonexistent target, creates it mode 700, and
+refuses a snapshot ID that isn't tagged for the app you named — a mistyped ID
+should not hand you another app's data. `latest` is app-scoped for the same
+reason.
+
+restic restores absolute paths under the target, so the staged database lands at
+a path this tool chose and can therefore point at exactly:
+
+```
+/var/tmp/restore/var/lib/tiny-server-helper/backup/stage/<app>/db.bolt
+/var/tmp/restore/srv/apps/<app>/shared/...
+```
+
+**`fetch` deliberately stops there.** Stopping the service, swapping the
+database in, fixing ownership, and verifying the result are app-specific and
+belong in the app's own restore doc — `Family-Portal/back-plan.md` for the first
+consumer.
+
+⚠️ **No restore drill has been run yet.** Nothing here is proven until an archive
+has actually been fetched and read back on the real box (`back-plan.md` §6).
 
 ## Monitoring
 
