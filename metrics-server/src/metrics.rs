@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::apps;
+use crate::apps::{self, BackupInfo, ReleaseInfo};
 use crate::log_reader::LogReader;
 use crate::system::{self, CpuSnapshot};
 
@@ -60,6 +60,8 @@ pub struct AppMetrics {
     pub name: String,
     pub disk_kb: u64,
     pub traffic: TrafficWindow,
+    pub backups: BackupInfo,
+    pub releases: Vec<ReleaseInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +85,7 @@ pub struct Config {
     pub port: u16,
     pub apps_dir: String,
     pub log_dir: String,
+    pub status_dir: String,
     pub collect_interval: u64,
     pub metrics_window_seconds: u64,
 }
@@ -104,6 +107,7 @@ pub async fn collect(
     *prev_cpu = curr_snapshot;
 
     let apps_dir = Path::new(&config.apps_dir);
+    let status_dir = Path::new(&config.status_dir);
     let app_names = apps::scan_apps(apps_dir);
     let mut traffic_map = log_reader.update(&app_names);
 
@@ -116,7 +120,9 @@ pub async fn collect(
                 window_seconds: config.metrics_window_seconds,
                 ..Default::default()
             });
-            AppMetrics { name, disk_kb, traffic }
+            let backups = apps::backup_info(&app_dir, status_dir, &name);
+            let releases = apps::release_history(&app_dir);
+            AppMetrics { name, disk_kb, traffic, backups, releases }
         })
         .collect();
 

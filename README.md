@@ -406,4 +406,21 @@ make deploy    # cargo build --release + ./bin/deploy metrics-server vps ... int
 ```
 
 Reads `PORT` and optional `API_KEY` from `shared/.env`; set `API_KEY` to keep it
-non-public.
+non-public. `APPS_DIR`, `LOG_DIR`, and `STATUS_DIR` override where it looks for
+apps, the Caddy access logs, and `backupctl`'s published status files.
+
+`/metrics` reports, per app under `/srv/apps`:
+
+- `disk_kb` and a Caddy traffic window (`requests_total`, `error_4xx`,
+  `error_5xx`, `error_pct`)
+- `releases` — the last five release directories, newest first, each with its
+  short SHA, the time the directory was created on this box, and whether
+  `current` points at it
+- `backups` — `registered` (does `shared/backup.conf` exist), and from
+  `backupctl`'s status file, `last_success`, `age_seconds`, and `size_kb`.
+  Registered with no `last_success` is an app whose backups have never once
+  worked, and is meant to be read as an alarm.
+
+It runs as `apps`, so it reads the mode-644 status files `backupctl` publishes
+under `/var/lib/tiny-server-helper/status/` rather than the mode-700 cache
+beside them.

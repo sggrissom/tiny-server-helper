@@ -61,6 +61,8 @@ async fn main() -> anyhow::Result<()> {
         port,
         apps_dir: std::env::var("APPS_DIR").unwrap_or_else(|_| "/srv/apps".into()),
         log_dir: std::env::var("LOG_DIR").unwrap_or_else(|_| "/var/log/caddy".into()),
+        status_dir: std::env::var("STATUS_DIR")
+            .unwrap_or_else(|_| "/var/lib/tiny-server-helper/status".into()),
         collect_interval: std::env::var("COLLECT_INTERVAL")
             .ok()
             .and_then(|v| v.parse().ok())

@@ -50,6 +50,15 @@ MAIL_ENV="$TSH_DIR/mail.env"
 APPS_DIR="/srv/apps"
 STATE_DIR="/var/lib/tiny-server-helper/backup"
 
+# What non-root readers are allowed to know about backups. STATE_DIR is mode 700
+# and stays that way - it holds the staging directory, which is a plaintext
+# database while a run is in flight - so a process that is not root cannot see
+# even the <app>.last timestamp inside it. metrics-server runs as `apps` and
+# publishes backup age to the app admin panels, so the facts it needs are
+# republished here instead of relaxing the mode on a directory holding
+# databases. Nothing reads these back: they are output, not state.
+STATUS_DIR="/var/lib/tiny-server-helper/status"
+
 SYSTEMD_DIR="/etc/systemd/system"
 # The timer units call backupctl by absolute path, so a unit file that is static
 # in git needs one agreed location. This is the only path in the repo that
@@ -143,6 +152,38 @@ install_file() {
   chown "$owner" "$tmp"
   chmod "$mode" "$tmp"
   mv "$tmp" "$dest"
+}
+
+# Republish an app's backup state where a non-root reader can see it. Called
+# only where <app>.last is written, so the two can never disagree, and a failed
+# run leaves the previous success standing and going stale - which is the signal
+# `check` alerts on and the panel renders.
+#
+# Size is best-effort for the same reason it is in `status`: older restic builds
+# reject snapshot filters on `stats`, and a cosmetic column must never be what
+# turns a successful backup into a failed unit.
+publish_status() {
+  local app="$1" now size_kb="null" out total
+  now="$(date +%s)"
+
+  if out="$(restic stats --mode raw-data --tag "app=$app" --json 2>/dev/null)"; then
+    total="$(printf '%s' "$out" | sed -n 's/.*"total_size":[[:space:]]*\([0-9]\{1,\}\).*/\1/p')"
+    [[ -n "$total" ]] && size_kb=$(( total / 1024 ))
+  fi
+
+  # A backup that succeeded must not be reported as failed because the box could
+  # not write a cosmetic file, so every step here is allowed to fail on its own.
+  if ! { mkdir -p "$STATUS_DIR" && chmod 755 "$STATUS_DIR"; }; then
+    log "$app: WARNING could not create $STATUS_DIR - backup age will read as never"
+    return 0
+  fi
+  if ! install_file "$STATUS_DIR/backup-$app.json" root:root 0644 <<EOF
+{"app":"$app","last_success":$now,"size_kb":$size_kb}
+EOF
+  then
+    log "$app: WARNING could not write $STATUS_DIR/backup-$app.json"
+  fi
+  return 0
 }
 
 require_setup() {
@@ -709,6 +750,7 @@ run_app() {
   # Written only after restic reported success, so the cache can never claim a
   # backup that did not happen.
   install_file "$STATE_DIR/$app.last" root:root 0644 <<<"$(date +%s)"
+  publish_status "$app"
 
   log "$app: OK in $(( $(date +%s) - started ))s"
   return 0
@@ -934,6 +976,8 @@ case "$cmd" in
     mkdir -p "$TSH_DIR"
     mkdir -p "$STATE_DIR"
     chmod 700 "$STATE_DIR"
+    mkdir -p "$STATUS_DIR"
+    chmod 755 "$STATUS_DIR"
 
     # backup.env holds the repository password, and losing it makes every
     # existing archive unreadable. Setup will not overwrite it, ever - not even
