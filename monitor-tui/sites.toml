@@ -38,11 +38,6 @@ url = "https://stevengrissom.com/healthz"
 expected_status = 200
 
 [[sites]]
-name = "Family Site"
-url = "https://grissom.zone/healthz"
-expected_status = 200
-
-[[sites]]
 name = "Releve Live"
 url = "https://releve.live/healthz"
 expected_status = 200
@@ -57,15 +52,6 @@ name = "Karaoke Maker"
 url = "https://karaoke.grissom.zone/healthz"
 expected_status = 200
 
-# /readyz, not /healthz: family's /healthz answers ok from a closure that
-# touches nothing, so it stays green through an unreadable database or an
-# unwritable static directory. /readyz opens a bolt transaction and round-trips
-# a temp file in shared/static/, which is the failure class worth waking up for.
-#
-# This is the site with the most moving parts of any here — a database, four
-# background workers, a WebSocket, a photo pipeline, a face-recognition daemon
-# over a Unix socket, APNs — so it alerts on the first failure rather than the
-# second.
 [[sites]]
 name = "Family Record"
 url = "https://familyrecord.app/readyz"
