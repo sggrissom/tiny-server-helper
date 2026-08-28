@@ -14,6 +14,7 @@ bin/bootstrap-vps   one-time server setup
 bin/deploy          local deploy script
 bin/mailctl         server-side outbound mail (Postfix + DKIM)
 bin/backupctl       server-side backups (restic), opt-in per app
+bin/watchctl        server-side monitoring, emails you when something breaks
 bin/monitor         one-off / watch health check
 systemd/            app@ and internal@ unit templates
 monitor-tui/        terminal dashboard for all sites
@@ -82,6 +83,9 @@ appctl status                  # all apps: running state + current release
 appctl logs <app>              # journalctl -f
 sudo appctl rollback <app>     # previous release
 sudo appctl domain <app> <fqdn>
+
+watchctl status                # what is currently failing
+watchctl list                  # what is watched
 ```
 
 ## Sending mail
@@ -243,9 +247,13 @@ sudo backupctl check          # non-zero + email if anything is stale
 sudo backupctl check --test   # prove the alert path works
 ```
 
-Set `ALERT_EMAIL=` in `/etc/tiny-server-helper/backup.env`. There is
-deliberately no default — `root@localhost` would be delivered, unread, forever,
-and `doctor` reports an unset `ALERT_EMAIL` as a hard failure.
+Set `ALERT_EMAIL=` in `/etc/tiny-server-helper/alert.env` (shared with
+`watchctl`, and written by `watchctl setup`). `backup.env` may set its own
+`ALERT_EMAIL`, which wins; the shared file exists so that knowing where to send
+mail does not require the ability to read a root:600 file holding
+`RESTIC_PASSWORD`. There is deliberately no default — `root@localhost` would be
+delivered, unread, forever, and `doctor` reports an unset `ALERT_EMAIL` as a
+hard failure.
 
 Mail goes out through the local Postfix that `mailctl setup` already configured,
 via `/usr/sbin/sendmail` — the same daemon as talking SMTP to `127.0.0.1:25` by
@@ -378,6 +386,110 @@ has actually been fetched and read back on the real box (`back-plan.md` §6).
 
 ## Monitoring
 
+Three things, in increasing order of how much they run without you: `watchctl`
+on the server, which mails you; the TUI on your laptop, which shows you; and
+`bin/monitor`, which answers one question right now.
+
+### watchctl — the server tells you
+
+Runs on the VPS under a timer and emails through the same Postfix that
+`mailctl setup` configured. It watches four things:
+
+| | |
+|---|---|
+| **sites** | every domain Caddy serves, every 5 min |
+| **failed units** | `systemctl --failed`, every 5 min |
+| **disk + inodes** | every real filesystem, every 5 min |
+| **TLS expiry** | every watched domain, daily |
+
+```bash
+watchctl doctor                       # preflight; run before anything else
+sudo watchctl setup you@example.com   # write alert.env, install + enable timers
+sudo watchctl check --test            # prove the alert path reaches you
+watchctl list                         # what is watched, and from which file
+watchctl status                       # what is failing right now
+sudo watchctl check --dry-run         # run every check, mail nothing
+```
+
+**Sites are watched by default, not opted into.** A site is registered because
+`/etc/caddy/sites/<app>.caddy` exists — which is to say because `appctl domain`
+put it there. This is the opposite of how backups work, on purpose: backing an
+app up unasked would consume repository space and stage its database in
+plaintext, so it waits to be told, while watching a public site costs one HTTP
+request and the failure mode of opt-in monitoring is the site nobody remembered
+to enrol, which is always the one that goes down.
+
+`/srv/apps/<app>/shared/watch.conf` therefore only *narrows* — its absence is
+not "unwatched":
+
+```ini
+path=/readyz     # default /healthz
+expect=200
+failures=1       # consecutive failures before alerting; default 3
+timeout=10
+enabled=no       # opt this site out entirely
+```
+
+For something this box does not serve, drop a file with a `url=` line into
+`/etc/tiny-server-helper/watch.d/`.
+
+### What arrives, and when
+
+One email per run, not one per finding — a bad deploy that takes four sites
+down is one event, and four separate mails are four chances to miss it. Sections
+are `NEW`, `STILL FAILING`, and `RECOVERED`, so a recovery is reported as
+explicitly as an outage.
+
+A site must fail `failures` consecutive probes (default 3, at 5-minute spacing,
+so ~10 minutes) before it counts as down — past a deploy's restart and past a
+single upstream blip. A failed unit, a full disk, and an expiring cert alert on
+the first observation instead: systemd has already done the retrying, and disks
+do not un-fill by themselves. A still-failing check re-alerts every
+`RENOTIFY_HOURS` (default 6), so "it is still down" is not something you have to
+remember to check.
+
+An undeliverable alert is **not** recorded as sent, so the next run tries again
+rather than assuming you were told.
+
+### The gap this cannot close
+
+`watchctl` runs on the box it watches. It will tell you an app crashed, a disk
+filled, or a certificate stopped renewing — it cannot mail you about an outage
+of the machine itself, because the thing that would send the mail is the thing
+that is down.
+
+Two ways to cover that, neither of which lives on the VPS:
+
+- Set `HEARTBEAT_URL=` in `alert.env`. `check` pings it every 5 minutes, and an
+  external dead-man's-switch notices when the pings stop.
+- Keep the TUI open (below), which polls from your laptop.
+
+### Configuration
+
+`/etc/tiny-server-helper/alert.env`, written by `watchctl setup` and shared with
+`backupctl`. Parsed, never sourced: an unknown key is a hard error, because
+`ALERT_EMAI=` would otherwise leave the recipient empty and a monitor whose
+alerts go nowhere looks exactly like everything being fine.
+
+```ini
+ALERT_EMAIL=you@example.com
+SITE_FAILURES=3
+SITE_TIMEOUT=10
+DISK_WARN_PERCENT=85
+INODE_WARN_PERCENT=85
+CERT_WARN_DAYS=14
+RENOTIFY_HOURS=6
+IGNORE_UNITS=certbot.service *.mount
+HEARTBEAT_URL=https://hc-ping.com/<uuid>
+```
+
+`watchctl.service` exits **zero even when checks are failing**. A site being
+down is news about an app, not about `watchctl`, and a permanently red unit is a
+red light you stop reading. The findings are in the mail, in
+`journalctl -u watchctl.service -g PROBLEM`, and in `watchctl status`.
+
+### From your laptop
+
 Quick check from anywhere:
 
 ```bash
@@ -395,7 +507,8 @@ cargo run -p monitor-tui
 It polls each `[[sites]]` URL, tracks history, and sends terminal-bell/desktop
 alerts on status transitions. Add a `[server_metrics]` section pointing at a
 deployed `metrics-server` to also show host CPU/memory/disk and internal service
-state.
+state. Unlike `watchctl` it only alerts while it is open — but for the same
+reason, it is the one thing here that still notices when the whole VPS is gone.
 
 ## metrics-server
 

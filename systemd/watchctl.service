@@ -1,0 +1,32 @@
+[Unit]
+Description=Check watched sites, failed units and disk use (watchctl check)
+# Site checks go out over the public interface and back in through Caddy, so
+# this needs the network in a way the disk and unit checks do not.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+
+# Exits zero even when checks are failing. A site being down is news about an
+# app, not about watchctl, and a permanently red watchctl.service is a red
+# light you stop reading - which would defeat the entire point of this unit.
+# Findings are mailed, and logged with a fixed, greppable shape:
+#   journalctl -u watchctl.service -g PROBLEM
+#   watchctl status
+ExecStart=/usr/local/bin/watchctl check
+
+# This runs every five minutes forever, next to the apps it is watching. It
+# must never be the reason a request is slow.
+Nice=10
+IOSchedulingClass=idle
+
+# Bounded well under the timer interval, so a hung run cannot still be holding
+# the state lock when the next one starts. Each probe is separately bounded by
+# SITE_TIMEOUT; this is the backstop for a run with many sites.
+TimeoutStartSec=240
+
+# Deliberately no [Install] section. This unit is started by watchctl.timer,
+# and a WantedBy=multi-user.target here would also run a check at every boot -
+# before the app@ units it is checking have finished starting.

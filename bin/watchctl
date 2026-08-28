@@ -1,0 +1,1186 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+Usage:
+  watchctl doctor
+  watchctl setup [<alert_email>]
+  watchctl check [--test] [--dry-run]
+  watchctl certs [--dry-run]
+  watchctl list
+  watchctl status
+
+Examples:
+  watchctl doctor
+  sudo watchctl setup you@example.com
+  sudo watchctl check --test          # prove alerts reach you
+  sudo watchctl check --dry-run       # run every check, mail nothing
+  watchctl list                       # what is watched, and why
+  watchctl status                     # current state of every check
+
+Every domain Caddy serves is watched, with no per-app opt-in: a site is
+registered by $CADDY_SITES/<app>.caddy, which \`appctl domain\` already
+writes. Override the path, expected status, or threshold - or opt a site
+out - in /srv/apps/<app>/shared/watch.conf. Watch something this box does
+not serve by dropping a .conf with a url= into $WATCH_D.
+
+setup installs and enables the timers that make this run on its own:
+  $CHECK_TIMER          every 5 min: sites, failed units, disk
+  $CERT_TIMER    daily: TLS expiry
+  systemctl list-timers 'watchctl*'
+  journalctl -u watchctl.service -g PROBLEM
+
+Alerts need ALERT_EMAIL set in $ALERT_ENV.
+EOF
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+TSH_DIR="/etc/tiny-server-helper"
+
+# Shared with backupctl, which reads ALERT_EMAIL from here when its own
+# backup.env does not set one. Deliberately a separate file: backup.env is
+# root:600 because it holds RESTIC_PASSWORD, and knowing where to send mail
+# should not require the ability to read the repository password.
+#
+# Parsed, never sourced, for the same reason backup.conf is: a typo'd key must
+# be a loud error rather than a silently unset recipient, and a file that
+# decides where alerts go should not also be able to execute as root.
+ALERT_ENV="$TSH_DIR/alert.env"
+
+# Written by mailctl setup. Read only for MAIL_HOSTNAME, so alerts come from
+# the domain that already has SPF and DKIM rather than a bare hostname every
+# receiver is entitled to distrust.
+MAIL_ENV="$TSH_DIR/mail.env"
+
+APPS_DIR="/srv/apps"
+
+# The registry. A domain Caddy serves is a domain worth watching, so this is
+# derived rather than opted into - see the "registry" section below.
+CADDY_SITES="/etc/caddy/sites"
+
+# Escape hatch for URLs this box does not serve: an off-box site, or an app
+# behind a proxy that is not this Caddy.
+WATCH_D="$TSH_DIR/watch.d"
+
+# Consecutive-failure counts and last-alert times, one file per check. Mode 755,
+# unlike backupctl's STATE_DIR: nothing here is secret, and `watchctl status`
+# is more useful when it does not need root.
+STATE_DIR="/var/lib/tiny-server-helper/watch"
+
+# Output, not state - the same contract as backupctl's status files. Nothing
+# here reads it back; it exists so metrics-server can render what is currently
+# failing without being root and without re-running any of these checks.
+STATUS_DIR="/var/lib/tiny-server-helper/status"
+
+SYSTEMD_DIR="/etc/systemd/system"
+# The timer units call watchctl by absolute path, so a unit file that is static
+# in git needs one agreed location. The only path in the repo that assumes
+# where watchctl is installed.
+BIN_LINK="/usr/local/bin/watchctl"
+CHECK_TIMER="watchctl.timer"
+CERT_TIMER="watchctl-certs.timer"
+UNITS=(watchctl.service watchctl.timer
+       watchctl-certs.service watchctl-certs.timer)
+
+SENDMAIL="/usr/sbin/sendmail"
+
+# --- tunables, all overridable in alert.env ---------------------------------
+
+# Consecutive failed probes before a site is called down. Three at the timer's
+# five-minute cadence is ~10 minutes of sustained failure, which is past a
+# restart-on-deploy and past a single upstream blip.
+SITE_FAILURES=3
+SITE_TIMEOUT=10
+SITE_PATH="/healthz"
+SITE_EXPECT=200
+
+DISK_WARN_PERCENT=85
+INODE_WARN_PERCENT=85
+
+# Caddy renews at 2/3 of a 90-day lifetime, so a cert inside 14 days means
+# renewal has been failing for roughly a fortnight, not that it is due.
+CERT_WARN_DAYS=14
+
+# A still-failing check re-alerts this often. Long enough not to be noise,
+# short enough that "it is still down" is not something you have to remember
+# to go and check.
+RENOTIFY_HOURS=6
+
+# Space-separated glob patterns of systemd units never to alert on.
+IGNORE_UNITS=""
+
+# Optional dead-man's switch. This box cannot mail you about its own outage -
+# no amount of local checking closes that gap - so `check` pings this URL on
+# every run and something off-box notices when the pings stop.
+HEARTBEAT_URL=""
+
+ALERT_EMAIL=""
+
+# ---------------------------------------------------------------------------
+# check output helpers
+#
+# Same contract as mailctl and backupctl: fails counts hard failures only, and
+# anything setup has not done yet reports as "-" (pending), so doctor stays
+# useful before setup has ever run.
+# ---------------------------------------------------------------------------
+fails=0
+ok()   { printf "  %-34s ✅ %s\n" "$1" "${2:-}"; }
+bad()  { printf "  %-34s ❌ %s\n" "$1" "${2:-}"; fails=$((fails + 1)); }
+warn() { printf "  %-34s ⚠  %s\n" "$1" "${2:-}"; }
+skip() { printf "  %-34s -  %s\n" "$1" "${2:-}"; }
+
+# check runs under a timer, so its output is the journal. Findings carry a
+# fixed, greppable shape: "watchctl: PROBLEM <key> <detail>".
+log()     { printf 'watchctl: %s\n' "$*"; }
+problem() { printf 'watchctl: PROBLEM %s %s\n' "$1" "$2" >&2; }
+
+need_root() { [[ "$(id -u)" -eq 0 ]] || die "$1 must run as root (use sudo)"; }
+
+# Follows bootstrap-vps on caddy and mailctl on postfix: detect, print the
+# install line, do not install. No package manager, no distro detection.
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 && return 0
+  echo "NOTE: missing: $1"
+  echo "Install, then re-run:"
+  echo "  sudo apt-get install -y $2"
+  exit 1
+}
+
+# Write a file atomically, then set owner and mode. mktemp lands in the target
+# directory so the mv cannot cross filesystems.
+install_file() {
+  local dest="$1" owner="$2" mode="$3" tmp
+  tmp="$(mktemp "$(dirname "$dest")/.watchctl.XXXXXX")"
+  cat >"$tmp"
+  chown "$owner" "$tmp"
+  chmod "$mode" "$tmp"
+  mv "$tmp" "$dest"
+}
+
+# ---------------------------------------------------------------------------
+# alert.env
+#
+# Hand-parsed, not sourced. An unknown key is a hard error: ALERT_EMAI= would
+# otherwise leave the recipient empty, and a monitor whose alerts go nowhere is
+# worse than no monitor, because it looks like everything is fine.
+# ---------------------------------------------------------------------------
+load_alert_env() {
+  local line key val lineno=0
+
+  [[ -f "$ALERT_ENV" ]] || return 1
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lineno=$((lineno + 1))
+    line="${line%%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "$line" == '#'* ]] && continue
+
+    [[ "$line" == *=* ]] || die "$ALERT_ENV line $lineno: not key=value: $line"
+    key="${line%%=*}"
+    val="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    # Strip one layer of quotes, which operators write out of EnvironmentFile
+    # habit and which would otherwise end up inside the address.
+    val="${val%\"}"; val="${val#\"}"
+    val="${val%\'}"; val="${val#\'}"
+
+    case "$key" in
+      ALERT_EMAIL)         ALERT_EMAIL="$val" ;;
+      SITE_FAILURES)       SITE_FAILURES="$val" ;;
+      SITE_TIMEOUT)        SITE_TIMEOUT="$val" ;;
+      DISK_WARN_PERCENT)   DISK_WARN_PERCENT="$val" ;;
+      INODE_WARN_PERCENT)  INODE_WARN_PERCENT="$val" ;;
+      CERT_WARN_DAYS)      CERT_WARN_DAYS="$val" ;;
+      RENOTIFY_HOURS)      RENOTIFY_HOURS="$val" ;;
+      IGNORE_UNITS)        IGNORE_UNITS="$val" ;;
+      HEARTBEAT_URL)       HEARTBEAT_URL="$val" ;;
+      *)
+        die "$ALERT_ENV line $lineno: unknown key '$key'"
+        ;;
+    esac
+  done <"$ALERT_ENV"
+
+  local n
+  for n in SITE_FAILURES SITE_TIMEOUT DISK_WARN_PERCENT INODE_WARN_PERCENT \
+           CERT_WARN_DAYS RENOTIFY_HOURS; do
+    [[ "${!n}" =~ ^[0-9]+$ ]] || die "$ALERT_ENV: $n must be a number (is: ${!n})"
+  done
+  (( SITE_FAILURES >= 1 )) || die "$ALERT_ENV: SITE_FAILURES must be at least 1"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# alerting
+#
+# Mail goes through the local Postfix that `mailctl setup` already configured,
+# via sendmail rather than a hand-rolled SMTP dialogue to 127.0.0.1:25 - same
+# daemon either way, but this gets queuing and retry. Identical to backupctl's
+# alert path on purpose: one way for this box to reach you.
+# ---------------------------------------------------------------------------
+alert_from() {
+  local host=""
+  [[ -f "$MAIL_ENV" ]] \
+    && host="$(grep -E '^MAIL_HOSTNAME=' "$MAIL_ENV" | head -n 1 | cut -d= -f2- || true)"
+  [[ -n "$host" ]] || host="$(hostname -f 2>/dev/null || hostname)"
+  echo "watchctl@$host"
+}
+
+# Why alerting cannot work right now, or empty if it can. Used by doctor and by
+# check, so the two never disagree about the state of the alert path.
+alert_blocker() {
+  [[ -f "$ALERT_ENV" ]] || { echo "$ALERT_ENV does not exist - run: sudo watchctl setup <email>"; return 0; }
+  [[ -n "${ALERT_EMAIL:-}" ]] || { echo "ALERT_EMAIL is not set in $ALERT_ENV"; return 0; }
+  [[ -x "$SENDMAIL" ]] || { echo "$SENDMAIL is missing - is Postfix installed? (see: mailctl doctor)"; return 0; }
+  echo ""
+}
+
+# send_alert <subject>, body on stdin.
+send_alert() {
+  local subject="$1" blocker
+  blocker="$(alert_blocker)"
+  if [[ -n "$blocker" ]]; then
+    log "ALERT UNDELIVERABLE: $blocker"
+    return 1
+  fi
+  # Auto-Submitted keeps a vacation responder or a bounce from starting a loop
+  # with a mailbox only ever written to by a timer.
+  {
+    printf 'From: %s\n' "$(alert_from)"
+    printf 'To: %s\n' "$ALERT_EMAIL"
+    printf 'Subject: %s\n' "$subject"
+    printf 'Auto-Submitted: auto-generated\n\n'
+    cat
+  } | "$SENDMAIL" -t -i
+}
+
+host_short() { hostname -s 2>/dev/null || hostname; }
+
+# ---------------------------------------------------------------------------
+# site registry
+#
+# The filesystem is the registry, as it is everywhere else here - but unlike
+# backups, which are opt-in per app, monitoring is derived: a site is watched
+# because /etc/caddy/sites/<app>.caddy exists, which is to say because Caddy
+# serves it. The two differ on purpose. Backing an app up without being asked
+# would consume repository space and stage its database in plaintext, so it
+# waits to be told. Watching a public site costs one HTTP request, and the
+# failure mode of opt-in monitoring is the site nobody remembered to enrol -
+# which is always the one that goes down.
+#
+# watch.conf therefore only narrows: it changes the path, the expected status,
+# or the threshold, or sets enabled=no. Its absence is not "unwatched".
+# ---------------------------------------------------------------------------
+conf_url=""
+conf_path=""
+conf_expect=""
+conf_failures=""
+conf_timeout=""
+conf_enabled=""
+conf_error=""
+
+parse_watch_conf() {
+  local conf="$1" line key val lineno=0
+
+  conf_url=""; conf_path=""; conf_expect=""
+  conf_failures=""; conf_timeout=""; conf_enabled=""; conf_error=""
+
+  [[ -f "$conf" ]] || { conf_error="no such file: $conf"; return 1; }
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lineno=$((lineno + 1))
+    line="${line%%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "$line" == '#'* ]] && continue
+
+    [[ "$line" == *=* ]] || { conf_error="line $lineno: not key=value: $line"; return 1; }
+    key="${line%%=*}"
+    val="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"
+    val="${val#"${val%%[![:space:]]*}"}"
+
+    case "$key" in
+      url)      conf_url="$val" ;;
+      path)     conf_path="$val" ;;
+      expect)   conf_expect="$val" ;;
+      failures) conf_failures="$val" ;;
+      timeout)  conf_timeout="$val" ;;
+      enabled)  conf_enabled="$val" ;;
+      *)
+        conf_error="line $lineno: unknown key '$key' (expected url, path, expect, failures, timeout, or enabled)"
+        return 1
+        ;;
+    esac
+  done <"$conf"
+
+  [[ -z "$conf_expect"   || "$conf_expect"   =~ ^[0-9]{3}$ ]] || { conf_error="expect must be a 3-digit status (is: $conf_expect)"; return 1; }
+  [[ -z "$conf_failures" || "$conf_failures" =~ ^[0-9]+$   ]] || { conf_error="failures must be a number (is: $conf_failures)"; return 1; }
+  [[ -z "$conf_timeout"  || "$conf_timeout"  =~ ^[0-9]+$   ]] || { conf_error="timeout must be a number (is: $conf_timeout)"; return 1; }
+  [[ -z "$conf_enabled"  || "$conf_enabled"  =~ ^(yes|no)$ ]] || { conf_error="enabled must be yes or no (is: $conf_enabled)"; return 1; }
+  [[ -z "$conf_path"     || "$conf_path" == /* ]] || { conf_error="path must start with / (is: $conf_path)"; return 1; }
+  [[ -z "$conf_url"      || "$conf_url" =~ ^https?:// ]] || { conf_error="url must be http:// or https:// (is: $conf_url)"; return 1; }
+  return 0
+}
+
+# The first domain in a Caddy site file: the first token of the first line that
+# opens a block. Multi-domain sites (a.com, www.a.com { ) are watched on their
+# first name, which is the canonical one appctl wrote.
+caddy_domain() {
+  local f="$1" line first
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$line" || "$line" == '#'* ]] && continue
+    [[ "$line" == *'{'* ]] || continue
+    first="${line%%[[:space:],{]*}"
+    [[ -n "$first" ]] || continue
+    echo "$first"
+    return 0
+  done <"$f"
+  return 1
+}
+
+# State keys become filenames, so they must survive being one.
+sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+
+# Every watched site, one per line:
+#   <key>\t<label>\t<url>\t<expect>\t<failures>\t<timeout>\t<source>
+# Ordering is stable (glob order), so `list` and `status` agree run to run.
+#
+# A row that could not be parsed comes back as key=BADCONF, carrying the error
+# in the <url> field. Its unused columns are "-" rather than empty: read splits
+# on IFS=tab, and tab is IFS whitespace, so a run of empty fields would collapse
+# into one delimiter and shift every column after it.
+watched_sites() {
+  local f app domain conf url expect failures timeout name
+
+  if [[ -d "$CADDY_SITES" ]]; then
+    for f in "$CADDY_SITES"/*.caddy; do
+      [[ -f "$f" ]] || continue
+      app="$(basename "$f" .caddy)"
+      domain="$(caddy_domain "$f")" || continue
+
+      expect="$SITE_EXPECT"; failures="$SITE_FAILURES"; timeout="$SITE_TIMEOUT"
+      url="https://$domain$SITE_PATH"
+
+      conf="$APPS_DIR/$app/shared/watch.conf"
+      if [[ -f "$conf" ]]; then
+        if ! parse_watch_conf "$conf"; then
+          # A malformed override must not silently fall back to the defaults it
+          # was written to change. Surfaced as its own failing check so it is
+          # alerted on rather than buried in the journal.
+          printf 'BADCONF\t%s\t%s\t-\t-\t-\t%s\n' "$app" "$conf_error" "$conf"
+          continue
+        fi
+        [[ "$conf_enabled" == no ]] && continue
+        [[ -n "$conf_url" ]]      && url="$conf_url"
+        [[ -n "$conf_path" ]]     && url="https://$domain$conf_path"
+        [[ -n "$conf_expect" ]]   && expect="$conf_expect"
+        [[ -n "$conf_failures" ]] && failures="$conf_failures"
+        [[ -n "$conf_timeout" ]]  && timeout="$conf_timeout"
+      fi
+
+      printf 'site-%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$(sanitize "$app")" "$app" "$url" "$expect" "$failures" "$timeout" "$f"
+    done
+  fi
+
+  if [[ -d "$WATCH_D" ]]; then
+    for f in "$WATCH_D"/*.conf; do
+      [[ -f "$f" ]] || continue
+      name="$(basename "$f" .conf)"
+      if ! parse_watch_conf "$f"; then
+        printf 'BADCONF\t%s\t%s\t-\t-\t-\t%s\n' "$name" "$conf_error" "$f"
+        continue
+      fi
+      [[ "$conf_enabled" == no ]] && continue
+      if [[ -z "$conf_url" ]]; then
+        printf 'BADCONF\t%s\t%s\t-\t-\t-\t%s\n' "$name" "url= is required in $WATCH_D" "$f"
+        continue
+      fi
+      printf 'site-%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$(sanitize "$name")" "$name" "$conf_url" \
+        "${conf_expect:-$SITE_EXPECT}" "${conf_failures:-$SITE_FAILURES}" \
+        "${conf_timeout:-$SITE_TIMEOUT}" "$f"
+    done
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# state
+#
+# One file per check, holding the consecutive failure count and when this check
+# last mailed. Both have to survive between runs: each run is a separate
+# process, so without this every transient blip is a fresh alert and every
+# sustained outage is an alert every five minutes.
+# ---------------------------------------------------------------------------
+st_status=""; st_since=""; st_fails=0; st_alerted=0; st_detail=""
+
+ensure_state_dir() {
+  mkdir -p "$STATE_DIR"
+  chmod 755 "$STATE_DIR"
+}
+
+state_read() {
+  local f="$STATE_DIR/$1.state" line key val
+  st_status="ok"; st_since=""; st_fails=0; st_alerted=0; st_detail=""
+  [[ -f "$f" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    key="${line%%=*}"; val="${line#*=}"
+    case "$key" in
+      status)  st_status="$val" ;;
+      since)   st_since="$val" ;;
+      fails)   st_fails="$val" ;;
+      alerted) st_alerted="$val" ;;
+      detail)  st_detail="$val" ;;
+    esac
+  done <"$f"
+  [[ "$st_fails"   =~ ^[0-9]+$ ]] || st_fails=0
+  [[ "$st_alerted" =~ ^[0-9]+$ ]] || st_alerted=0
+}
+
+state_write() {
+  local key="$1" status="$2" since="$3" fails="$4" alerted="$5" detail="$6"
+  install_file "$STATE_DIR/$key.state" root:root 0644 <<EOF
+status=$status
+since=$since
+fails=$fails
+alerted=$alerted
+detail=$detail
+EOF
+}
+
+state_clear() { rm -f "$STATE_DIR/$1.state"; }
+
+human_age() {
+  local secs="$1"
+  if (( secs < 3600 )); then echo "$((secs / 60))m"
+  elif (( secs < 172800 )); then echo "$((secs / 3600))h"
+  else echo "$((secs / 86400))d"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# the run
+#
+# Every check funnels through record_ok / record_fail, which own the whole
+# question of what deserves an email. Checks themselves only decide what is
+# true right now; nothing else looks at cooldowns or thresholds.
+# ---------------------------------------------------------------------------
+now=0
+dry_run=no
+new_problems=()   # crossed the threshold this run
+still_problems=() # still failing, past the renotify window
+recovered=()      # was alerted on, now healthy
+mark_alerted=()   # keys to stamp once the mail is actually away
+failing_now=()    # everything currently failing, for the status file
+
+record_fail() {
+  local key="$1" label="$2" detail="$3" threshold="${4:-$SITE_FAILURES}"
+  local fails since
+
+  state_read "$key"
+  fails=$(( st_fails + 1 ))
+  since="${st_since:-$now}"
+  [[ "$st_status" == bad ]] || since="$now"
+
+  problem "$key" "$detail"
+  failing_now+=("$key")
+
+  if (( fails >= threshold )); then
+    if (( st_alerted == 0 )); then
+      new_problems+=("$label|$detail|$(human_age $(( now - since )))")
+      mark_alerted+=("$key")
+    elif (( now - st_alerted >= RENOTIFY_HOURS * 3600 )); then
+      still_problems+=("$label|$detail|$(human_age $(( now - since )))")
+      mark_alerted+=("$key")
+    fi
+  fi
+
+  [[ "$dry_run" == yes ]] && return 0
+  # st_alerted is preserved here and only advanced after the mail is actually
+  # accepted, so an undeliverable alert is retried next run instead of being
+  # silently marked as sent.
+  state_write "$key" bad "$since" "$fails" "$st_alerted" "$detail"
+}
+
+record_ok() {
+  local key="$1" label="$2"
+  state_read "$key"
+  if [[ "$st_status" == bad ]] && (( st_alerted > 0 )); then
+    recovered+=("$label|was: $st_detail|$(human_age $(( now - ${st_since:-$now} )))")
+  fi
+  # Clearing rather than writing status=ok keeps STATE_DIR to only what is
+  # currently interesting, so `status` is short and a stale key from a
+  # deregistered site disappears on its own.
+  [[ "$dry_run" == yes ]] || state_clear "$key"
+}
+
+# --- checks ----------------------------------------------------------------
+
+probe_code=""
+probe_detail=""
+
+# One HTTP probe, with a single immediate retry. The consecutive-failure
+# threshold already absorbs a blip across runs; the retry keeps one dropped
+# packet from spending a whole five-minute interval to be re-tested.
+http_probe() {
+  local url="$1" timeout="$2" expect="$3" attempt code rc
+  for attempt in 1 2; do
+    rc=0
+    code="$(curl -sS -o /dev/null -w '%{http_code}' \
+             --max-time "$timeout" \
+             -A 'watchctl (tiny-server-helper)' \
+             "$url" 2>"$err_file")" || rc=$?
+    probe_code="$code"
+    if (( rc == 0 )) && [[ "$code" == "$expect" ]]; then
+      probe_detail=""
+      return 0
+    fi
+    if (( rc != 0 )); then
+      probe_detail="$(head -n 1 "$err_file" | sed 's/^curl: //')"
+      [[ -n "$probe_detail" ]] || probe_detail="curl exited $rc"
+    else
+      probe_detail="HTTP $code, expected $expect"
+    fi
+    (( attempt == 1 )) && sleep 2
+  done
+  return 1
+}
+
+check_sites() {
+  local key label url expect failures timeout source
+  while IFS=$'\t' read -r key label url expect failures timeout source; do
+    [[ -n "$key" ]] || continue
+    if [[ "$key" == BADCONF ]]; then
+      # $url carries the parse error for a BADCONF row, $source the file.
+      record_fail "conf-$(sanitize "$label")" "config $source" "$url" 1
+      continue
+    fi
+    # A previously broken override that now parses is a recovery like any
+    # other; without this its conf-* key would stay failing forever.
+    record_ok "conf-$(sanitize "$label")" "config for $label"
+    if http_probe "$url" "$timeout" "$expect"; then
+      record_ok "$key" "$label ($url)"
+    else
+      record_fail "$key" "$label ($url)" "$probe_detail" "$failures"
+    fi
+  done < <(watched_sites)
+}
+
+# systemd's own view of what is broken. Often the earliest signal there is: an
+# app that exhausted its restarts is a failed unit some seconds before it is a
+# failing health check, and a unit with no domain has no health check at all.
+check_units() {
+  local unit pat ignored
+  command -v systemctl >/dev/null 2>&1 || return 0
+  while read -r unit _; do
+    [[ -n "$unit" ]] || continue
+    ignored=no
+    for pat in $IGNORE_UNITS; do
+      # shellcheck disable=SC2053
+      [[ "$unit" == $pat ]] && { ignored=yes; break; }
+    done
+    [[ "$ignored" == yes ]] && continue
+    # Threshold 1: systemd has already done the retrying, so a unit that reads
+    # as failed has finished failing. Waiting three runs only delays the news.
+    record_fail "unit-$(sanitize "$unit")" "unit $unit" \
+      "failed - journalctl -u $unit -n 50" 1
+  done < <(systemctl list-units --failed --no-legend --plain --all 2>/dev/null | awk '{print $1}')
+}
+
+# A full disk breaks deploys, backups, Caddy's cert renewal and Postfix's queue
+# at once - including, pointedly, the queue this alert has to leave through.
+check_disk() {
+  local src fstype size used avail pct mount key inodes iused ifree
+  while read -r src fstype size used avail pct mount; do
+    [[ "$src" == Filesystem ]] && continue
+    case "$fstype" in
+      tmpfs|devtmpfs|squashfs|overlay|efivarfs|ramfs|autofs|fuse.*) continue ;;
+    esac
+    pct="${pct%\%}"
+    [[ "$pct" =~ ^[0-9]+$ ]] || continue
+    key="disk-$(sanitize "$mount")"
+    if (( pct >= DISK_WARN_PERCENT )); then
+      record_fail "$key" "disk $mount" "${pct}% full, $avail free (threshold ${DISK_WARN_PERCENT}%)" 1
+    else
+      record_ok "$key" "disk $mount"
+    fi
+  done < <(df -PT 2>/dev/null)
+
+  while read -r src fstype inodes iused ifree pct mount; do
+    [[ "$src" == Filesystem ]] && continue
+    case "$fstype" in
+      tmpfs|devtmpfs|squashfs|overlay|efivarfs|ramfs|autofs|fuse.*) continue ;;
+    esac
+    pct="${pct%\%}"
+    [[ "$pct" =~ ^[0-9]+$ ]] || continue
+    key="inode-$(sanitize "$mount")"
+    if (( pct >= INODE_WARN_PERCENT )); then
+      record_fail "$key" "inodes $mount" "${pct}% of inodes used, $ifree free" 1
+    else
+      record_ok "$key" "inodes $mount"
+    fi
+  done < <(df -PTi 2>/dev/null)
+}
+
+# Expiry of the certificate actually being served, read over the wire rather
+# than out of Caddy's storage: what a browser gets is the thing that matters,
+# and this also covers a cert Caddy is not the one serving.
+check_certs() {
+  local key label url expect failures timeout source host enddate exp days
+  while IFS=$'\t' read -r key label url expect failures timeout source; do
+    [[ -n "$key" && "$key" != BADCONF ]] || continue
+    [[ "$url" == https://* ]] || continue
+    host="${url#https://}"
+    host="${host%%/*}"
+    host="${host%%:*}"
+    key="cert-$(sanitize "$host")"
+
+    enddate="$(echo \
+      | timeout 15 openssl s_client -connect "$host:443" -servername "$host" 2>/dev/null \
+      | openssl x509 -noout -enddate 2>/dev/null)" || true
+
+    if [[ -z "$enddate" ]]; then
+      # Deliberately not an alert. If the host is unreachable, `check` is
+      # already saying so every five minutes, and a second alert for the same
+      # outage teaches you to ignore both.
+      log "cert $host: could not read a certificate (host unreachable?) - skipping"
+      continue
+    fi
+
+    exp="$(date -d "${enddate#notAfter=}" +%s 2>/dev/null)" || {
+      log "cert $host: could not parse expiry '$enddate' - skipping"
+      continue
+    }
+    days=$(( (exp - now) / 86400 ))
+
+    if (( days <= CERT_WARN_DAYS )); then
+      record_fail "$key" "cert $host" \
+        "expires in ${days}d ($(date -d "@$exp" '+%Y-%m-%d')) - renewal is failing" 1
+    else
+      record_ok "$key" "cert $host"
+    fi
+  done < <(watched_sites)
+}
+
+# --- reporting -------------------------------------------------------------
+
+# Everything a run found goes out as one email, not one per finding: a bad
+# deploy that takes four sites down at once is one event, and four separate
+# mails would be four chances to miss it.
+report_and_alert() {
+  local kind="$1" body subject n_new n_still n_rec line label detail age rc=0 key
+
+  n_new=${#new_problems[@]}
+  n_still=${#still_problems[@]}
+  n_rec=${#recovered[@]}
+
+  if (( n_new + n_still + n_rec == 0 )); then
+    # Healthy, so nothing gets mailed - which is exactly when a broken alert
+    # path goes unnoticed until the day it was supposed to work. Same reasoning
+    # as backupctl check, and the same decision not to make it a failure.
+    local blocker
+    blocker="$(alert_blocker)"
+    [[ -n "$blocker" ]] && log "WARNING: nothing is wrong, but alerting is unusable: $blocker"
+    return 0
+  fi
+
+  body="$( {
+    if (( n_new > 0 )); then
+      echo "NEW:"
+      for line in "${new_problems[@]}"; do
+        label="${line%%|*}"; detail="${line#*|}"; age="${detail#*|}"; detail="${detail%%|*}"
+        printf '  %s\n      %s (failing %s)\n' "$label" "$detail" "$age"
+      done
+      echo ""
+    fi
+    if (( n_still > 0 )); then
+      echo "STILL FAILING:"
+      for line in "${still_problems[@]}"; do
+        label="${line%%|*}"; detail="${line#*|}"; age="${detail#*|}"; detail="${detail%%|*}"
+        printf '  %s\n      %s (failing %s)\n' "$label" "$detail" "$age"
+      done
+      echo ""
+    fi
+    if (( n_rec > 0 )); then
+      echo "RECOVERED:"
+      for line in "${recovered[@]}"; do
+        label="${line%%|*}"; detail="${line#*|}"; age="${detail#*|}"; detail="${detail%%|*}"
+        printf '  %s\n      %s (down %s)\n' "$label" "$detail" "$age"
+      done
+      echo ""
+    fi
+    echo "What to look at, on the box:"
+    echo "  appctl status"
+    echo "  systemctl --failed"
+    echo "  journalctl -u watchctl.service -n 100"
+    echo "  watchctl status"
+    echo ""
+    echo "Checked by watchctl on $(host_short) at $(date -Is)."
+  } )"
+
+  if [[ "$dry_run" == yes ]]; then
+    echo "--- would send ---"
+    printf '%s\n' "$body"
+    return 0
+  fi
+
+  local what="problem(s)"
+  [[ "$kind" == certs ]] && what="certificate problem(s)"
+  if (( n_new + n_still > 0 )); then
+    subject="[watchctl] $(( n_new + n_still )) $what on $(host_short)"
+  else
+    subject="[watchctl] recovered: $n_rec check(s) on $(host_short)"
+  fi
+
+  # Printed as well as mailed, so the journal carries what the alert said and an
+  # undeliverable alert does not also lose the finding.
+  printf '%s\n' "$body" | sed 's/^/watchctl: /'
+
+  printf '%s\n' "$body" | send_alert "$subject" || rc=$?
+  if (( rc == 0 )); then
+    log "alert sent to $ALERT_EMAIL"
+    # Only now is a check recorded as having been reported. If sendmail
+    # refused, the next run tries again rather than assuming you were told.
+    for key in ${mark_alerted[@]+"${mark_alerted[@]}"}; do
+      state_read "$key"
+      state_write "$key" bad "${st_since:-$now}" "$st_fails" "$now" "$st_detail"
+    done
+  fi
+  return 0
+}
+
+# Output, not state. Never allowed to fail a run: a monitor that reports itself
+# broken because it could not write a cosmetic JSON file is worse than one that
+# quietly skips it.
+publish_status() {
+  local kind="$1" key list=""
+  [[ "$dry_run" == yes ]] && return 0
+  for key in ${failing_now[@]+"${failing_now[@]}"}; do
+    list="$list${list:+,}\"$key\""
+  done
+  if ! { mkdir -p "$STATUS_DIR" && chmod 755 "$STATUS_DIR"; }; then
+    return 0
+  fi
+  install_file "$STATUS_DIR/watch-$kind.json" root:root 0644 <<EOF || true
+{"kind":"$kind","checked_at":$now,"failing":${#failing_now[@]},"keys":[$list]}
+EOF
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# scheduling
+#
+# Unit files live in the repo's systemd/ next to app@.service rather than in a
+# heredoc here, so they are reviewed as unit files. setup installs them, as
+# backupctl's does: a monitor you have to remember to schedule stops running
+# the week you forget, and stops silently.
+# ---------------------------------------------------------------------------
+self_path() { readlink -f "${BASH_SOURCE[0]}"; }
+units_dir() { echo "$(dirname "$(dirname "$(self_path)")")/systemd"; }
+
+unit_prop() { systemctl show "$1" -p "$2" --value 2>/dev/null; }
+unit_installed() { [[ -f "$SYSTEMD_DIR/$1" ]]; }
+
+doctor_timer() {
+  local timer="$1" consequence="$2"
+  if ! unit_installed "$timer"; then
+    if [[ "$have_env" == no ]]; then
+      skip "$timer" "not installed (setup not run?)"
+    else
+      bad "$timer" "not installed - $consequence; re-run setup"
+    fi
+  elif [[ "$(systemctl is-enabled "$timer" 2>/dev/null)" != enabled ]]; then
+    bad "$timer" "installed but not enabled ($consequence) - fix: sudo systemctl enable --now $timer"
+  elif [[ "$(systemctl is-active "$timer" 2>/dev/null)" != active ]]; then
+    bad "$timer" "enabled but not active - fix: sudo systemctl start $timer"
+  else
+    ok "$timer" "next: $(unit_prop "$timer" NextElapseUSecRealtime)"
+  fi
+}
+
+install_units() {
+  local src u changed=no t
+  src="$(units_dir)"
+
+  for u in "${UNITS[@]}"; do
+    if [[ ! -f "$src/$u" ]]; then
+      echo "⚠  Cannot install timers: $src/$u not found."
+      echo "   watchctl looks for its unit files next to itself, in the repo's"
+      echo "   systemd/ directory. Checks will work when run by hand, but"
+      echo "   nothing is scheduled - which is the same as not monitoring."
+      echo "   Install them from a checkout:"
+      echo "     sudo cp systemd/watchctl*.{service,timer} $SYSTEMD_DIR/"
+      echo "     sudo systemctl daemon-reload"
+      echo "     sudo systemctl enable --now $CHECK_TIMER $CERT_TIMER"
+      return 1
+    fi
+  done
+
+  # A symlink rather than a copy, for the same reason backupctl uses one: a
+  # stale copy in /usr/local/bin that quietly differs from the checkout is a
+  # nasty thing to debug, and worse when the thing that diverged is the tool
+  # you trust to tell you something is wrong.
+  if [[ ! -e "$BIN_LINK" ]]; then
+    ln -s "$(self_path)" "$BIN_LINK"
+    echo "Linked $BIN_LINK -> $(self_path)"
+  elif [[ "$(readlink -f "$BIN_LINK")" != "$(self_path)" ]]; then
+    echo "⚠  $BIN_LINK already exists and points at $(readlink -f "$BIN_LINK"),"
+    echo "   not $(self_path). Leaving it alone - the timer will run that copy."
+  fi
+
+  for u in "${UNITS[@]}"; do
+    if ! cmp -s "$src/$u" "$SYSTEMD_DIR/$u"; then
+      install_file "$SYSTEMD_DIR/$u" root:root 0644 <"$src/$u"
+      echo "Installed $SYSTEMD_DIR/$u"
+      changed=yes
+    fi
+  done
+  [[ "$changed" == yes ]] && systemctl daemon-reload
+
+  for t in "$CHECK_TIMER" "$CERT_TIMER"; do
+    systemctl enable --now "$t" >/dev/null 2>&1 \
+      || { echo "⚠  Could not enable $t - check: systemctl status $t"; return 1; }
+    echo "Enabled $t ($(unit_prop "$t" NextElapseUSecRealtime))"
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+
+cmd="${1:-}"
+[[ -n "$cmd" ]] || { usage; exit 1; }
+
+case "$cmd" in
+  doctor)
+    echo "== watchctl doctor =="
+    echo ""
+    echo "Tools:"
+    require_cmd curl curl
+    ok "curl" "$(curl --version 2>/dev/null | head -n 1 | cut -d' ' -f1-2)"
+    if command -v openssl >/dev/null 2>&1; then
+      ok "openssl" "$(openssl version 2>/dev/null)"
+    else
+      bad "openssl" "missing - TLS expiry cannot be checked (sudo apt-get install -y openssl)"
+    fi
+
+    echo ""
+    echo "Configuration:"
+    have_env=no
+    if [[ ! -f "$ALERT_ENV" ]]; then
+      skip "$ALERT_ENV" "not present (setup not run?)"
+    else
+      load_alert_env
+      env_owner="$(stat -c '%U' "$ALERT_ENV")"
+      if [[ "$env_owner" == root ]]; then
+        ok "$ALERT_ENV" "root-owned, parsed cleanly"
+        have_env=yes
+      else
+        bad "$ALERT_ENV" "owned by $env_owner - must be root, or any local user can redirect your alerts"
+      fi
+    fi
+
+    if [[ -d "$CADDY_SITES" ]]; then
+      ok "$CADDY_SITES" "$(find "$CADDY_SITES" -maxdepth 1 -name '*.caddy' 2>/dev/null | wc -l) site file(s)"
+    else
+      warn "$CADDY_SITES" "does not exist - no sites are watched (appctl domain creates it)"
+    fi
+
+    # --- alert path -------------------------------------------------------
+    # Checked here rather than only at alert time, which is far too late to
+    # find out. Same reasoning as backupctl doctor.
+    if [[ "$have_env" == no ]]; then
+      if [[ -f "$ALERT_ENV" ]]; then
+        skip "Alerting" "$ALERT_ENV is not usable - see above"
+      else
+        skip "Alerting" "no $ALERT_ENV"
+      fi
+    else
+      blocker="$(alert_blocker)"
+      if [[ -n "$blocker" ]]; then
+        bad "Alerting" "$blocker"
+      else
+        ok "Alerting" "$ALERT_EMAIL via $SENDMAIL (prove it: sudo watchctl check --test)"
+        if command -v systemctl >/dev/null 2>&1 \
+           && [[ "$(systemctl is-active postfix 2>/dev/null)" != active ]]; then
+          warn "Alerting" "postfix is not active - alerts will queue, not send (mailctl doctor)"
+        fi
+      fi
+    fi
+
+    if [[ -n "$HEARTBEAT_URL" ]]; then
+      ok "Heartbeat" "$HEARTBEAT_URL"
+    else
+      warn "Heartbeat" "unset - nothing off-box notices if this whole machine goes down"
+    fi
+
+    echo ""
+    echo "Scheduling:"
+    if [[ ! -e "$BIN_LINK" ]]; then
+      if [[ "$have_env" == no ]]; then
+        skip "$BIN_LINK" "not installed (setup not run?)"
+      else
+        bad "$BIN_LINK" "missing - the timers call this path; re-run setup"
+      fi
+    elif [[ "$(readlink -f "$BIN_LINK")" != "$(self_path)" ]]; then
+      warn "$BIN_LINK" "points at $(readlink -f "$BIN_LINK"), not $(self_path)"
+    else
+      ok "$BIN_LINK" "-> $(self_path)"
+    fi
+    doctor_timer "$CHECK_TIMER" "nothing tells you a site went down"
+    doctor_timer "$CERT_TIMER" "nothing tells you a certificate stopped renewing"
+
+    if [[ -d "$STATE_DIR" ]]; then
+      ok "$STATE_DIR" "$(find "$STATE_DIR" -maxdepth 1 -name '*.state' 2>/dev/null | wc -l) check(s) currently failing"
+    else
+      skip "$STATE_DIR" "not created yet (no check has run)"
+    fi
+
+    echo ""
+    echo "Watched:"
+    any=no
+    while IFS=$'\t' read -r key label url expect failures timeout source; do
+      [[ -n "$key" ]] || continue
+      any=yes
+      if [[ "$key" == BADCONF ]]; then
+        bad "$label" "$url ($source)"
+      else
+        # Deliberately not ok(): doctor has not probed these, and a green tick
+        # here would read as "the site is up" rather than "the site is watched".
+        printf "  %-34s    %s (expect %s, after %s)\n" "$label" "$url" "$expect" "$failures"
+      fi
+    done < <(watched_sites)
+    [[ "$any" == no ]] && echo "  (nothing watched - no $CADDY_SITES/*.caddy and no $WATCH_D/*.conf)"
+
+    echo ""
+    if (( fails > 0 )); then
+      echo "$fails problem(s) found."
+      exit 1
+    fi
+    echo "All good."
+    ;;
+
+  setup)
+    need_root setup
+    email="${2:-}"
+
+    mkdir -p "$TSH_DIR"
+    chmod 755 "$TSH_DIR"
+    mkdir -p "$WATCH_D"
+    chmod 755 "$WATCH_D"
+    ensure_state_dir
+
+    if [[ -f "$ALERT_ENV" ]]; then
+      # Never overwritten. It is shared with backupctl and may carry tuning an
+      # operator chose deliberately; re-running setup must not quietly reset it.
+      echo "Keeping existing $ALERT_ENV (not overwritten)."
+      load_alert_env
+      if [[ -n "$email" && "$email" != "$ALERT_EMAIL" ]]; then
+        echo "⚠  It sets ALERT_EMAIL=$ALERT_EMAIL, not $email."
+        echo "   Change it by hand if that is wrong: sudoedit $ALERT_ENV"
+      fi
+    else
+      [[ -n "$email" ]] || die "missing <alert_email> - usage: sudo watchctl setup you@example.com"
+      install_file "$ALERT_ENV" root:root 0644 <<EOF
+# Where this box sends anything that needs your attention.
+#
+# Read by watchctl and by backupctl (which prefers its own ALERT_EMAIL in
+# backup.env if that sets one). Parsed, not sourced: an unknown key is a hard
+# error rather than a silently ignored typo.
+ALERT_EMAIL=$email
+
+# Consecutive failed probes before a site is called down, and the per-probe
+# timeout in seconds. At the 5-minute timer cadence, 3 is ~10 minutes.
+#SITE_FAILURES=$SITE_FAILURES
+#SITE_TIMEOUT=$SITE_TIMEOUT
+
+# Percent-full thresholds.
+#DISK_WARN_PERCENT=$DISK_WARN_PERCENT
+#INODE_WARN_PERCENT=$INODE_WARN_PERCENT
+
+# Warn this many days before a certificate expires. Caddy renews at 30 days
+# left, so 14 means renewal has been failing for a fortnight.
+#CERT_WARN_DAYS=$CERT_WARN_DAYS
+
+# How often a still-failing check re-alerts.
+#RENOTIFY_HOURS=$RENOTIFY_HOURS
+
+# Space-separated globs of systemd units never to alert on.
+#IGNORE_UNITS=certbot.service *.mount
+
+# Optional dead-man's switch. This box cannot mail you about its own outage;
+# watchctl pings this on every check run so something off-box can notice when
+# the pings stop.
+#HEARTBEAT_URL=https://hc-ping.com/<uuid>
+EOF
+      echo "Wrote $ALERT_ENV (alerts go to $email)"
+    fi
+
+    echo ""
+    scheduled=yes
+    install_units || scheduled=no
+
+    echo ""
+    if [[ "$scheduled" == yes ]]; then
+      echo "✅ Setup complete."
+    else
+      # Not "complete". A monitor nothing runs on a schedule is not a monitor,
+      # and this is the one line an operator skimming the output will read.
+      echo "⚠  Setup incomplete: alerts are configured, but nothing is scheduled."
+      echo "   Fix the timer problem above, then re-run: sudo watchctl setup"
+    fi
+    echo ""
+    echo "Next:"
+    echo "  sudo watchctl check --test      # prove the alert path reaches you"
+    echo "  watchctl list                  # confirm the right things are watched"
+    echo ""
+    echo "Note: watchctl runs on the box it watches, so it can tell you an app"
+    echo "crashed, a disk filled, or a cert stopped renewing - but it cannot"
+    echo "mail you about an outage of the machine itself. Set HEARTBEAT_URL in"
+    echo "$ALERT_ENV if you want that covered."
+    ;;
+
+  check|certs)
+    need_root "$cmd"
+    load_alert_env || die "not set up yet - run: sudo watchctl setup <email>"
+    require_cmd curl curl
+    [[ "$cmd" == certs ]] && require_cmd openssl openssl
+
+    for arg in "${@:2}"; do
+      case "$arg" in
+        --test)    test_only=yes ;;
+        --dry-run) dry_run=yes ;;
+        *) die "unknown option: $arg" ;;
+      esac
+    done
+
+    # --test sends an alert unconditionally. The alert path is the thing that is
+    # supposed to tell you something broke, so being able to prove it works
+    # without first breaking something is the point.
+    if [[ "${test_only:-no}" == yes ]]; then
+      blocker="$(alert_blocker)"
+      [[ -z "$blocker" ]] || die "alerting is not usable: $blocker"
+      if send_alert "[watchctl] test alert from $(host_short)" <<EOF
+This is a test of the watchctl alert path, sent by:
+
+  watchctl check --test
+
+If you are reading this, a real alert would have reached you too.
+EOF
+      then
+        log "test alert sent to $ALERT_EMAIL"
+        exit 0
+      fi
+      die "sendmail failed - check: journalctl -u postfix -n 50"
+    fi
+
+    ensure_state_dir
+
+    # Two runs must not interleave: both would read the same failure count,
+    # increment it, and write it back. A skipped run is harmless at a
+    # five-minute cadence; a corrupted count is not.
+    exec 9>"$STATE_DIR/.lock"
+    if ! flock -n 9; then
+      log "another run is in progress - skipping"
+      exit 0
+    fi
+
+    err_file="$(mktemp)"
+    trap 'rm -f "$err_file"' EXIT
+
+    now="$(date +%s)"
+
+    if [[ "$cmd" == check ]]; then
+      check_sites
+      check_units
+      check_disk
+    else
+      check_certs
+    fi
+
+    report_and_alert "$cmd"
+    publish_status "$cmd"
+
+    # The heartbeat fires whether or not anything is wrong: it answers "is this
+    # box alive and still checking", which stays a separate question from "is
+    # everything healthy". Failing to ping never fails the run.
+    if [[ "$cmd" == check && -n "$HEARTBEAT_URL" && "$dry_run" == no ]]; then
+      curl -sS -o /dev/null --max-time 10 "$HEARTBEAT_URL" 2>/dev/null \
+        || log "WARNING: heartbeat ping to $HEARTBEAT_URL failed"
+    fi
+
+    # Exits zero even when checks failed. A failing site is news about an app,
+    # not about watchctl, and a permanently red watchctl.service is a red light
+    # you stop reading. The mail and the PROBLEM lines in the journal are the
+    # signal; `watchctl status` is the summary.
+    if (( ${#failing_now[@]} > 0 )); then
+      log "${#failing_now[@]} check(s) failing"
+    else
+      log "all checks OK"
+    fi
+    ;;
+
+  list)
+    load_alert_env || true
+    echo "Watched sites:"
+    echo ""
+    any=no
+    while IFS=$'\t' read -r key label url expect failures timeout source; do
+      [[ -n "$key" ]] || continue
+      any=yes
+      if [[ "$key" == BADCONF ]]; then
+        printf "  %-18s BAD CONFIG: %s\n                     %s\n" "$label" "$url" "$source"
+      else
+        printf "  %-18s %s\n                     expect %s, alert after %s failure(s), %ss timeout\n                     from %s\n" \
+          "$label" "$url" "$expect" "$failures" "$timeout" "$source"
+      fi
+    done < <(watched_sites)
+    if [[ "$any" == no ]]; then
+      echo "  (nothing watched)"
+      echo ""
+      echo "  Sites come from $CADDY_SITES/*.caddy, written by: sudo appctl domain <app> <domain>"
+      echo "  Anything else goes in $WATCH_D/<name>.conf with a url= line."
+    fi
+    echo ""
+    echo "Also checked, with no configuration: failed systemd units, disk and"
+    echo "inode use on every real filesystem, and TLS expiry for the above."
+    ;;
+
+  status)
+    load_alert_env || true
+    now="$(date +%s)"
+    echo "Currently failing:"
+    echo ""
+    any=no
+    if [[ -d "$STATE_DIR" ]]; then
+      for f in "$STATE_DIR"/*.state; do
+        [[ -f "$f" ]] || continue
+        any=yes
+        key="$(basename "$f" .state)"
+        state_read "$key"
+        printf "  %-28s %-8s %s\n" "$key" \
+          "$(human_age $(( now - ${st_since:-$now} )))" "$st_detail"
+        if (( st_alerted > 0 )); then
+          printf "  %-28s %-8s alerted %s ago\n" "" "" "$(human_age $(( now - st_alerted )))"
+        else
+          printf "  %-28s %-8s %s consecutive failure(s), not yet alerted\n" "" "" "$st_fails"
+        fi
+      done
+    fi
+    [[ "$any" == no ]] && echo "  (nothing - every check passed on its last run)"
+    echo ""
+    if [[ -d "$STATE_DIR" ]]; then
+      echo "  A check disappears from this list as soon as it passes again."
+      echo "  Last run: $(systemctl show watchctl.service -p ExecMainExitTimestamp --value 2>/dev/null || echo unknown)"
+    fi
+    ;;
+
+  *)
+    usage
+    exit 1
+    ;;
+esac

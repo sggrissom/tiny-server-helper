@@ -1,0 +1,17 @@
+[Unit]
+Description=Daily TLS expiry check for watched domains
+
+[Timer]
+# Daily is ample: CERT_WARN_DAYS is 14, so there are two weeks of mornings in
+# which to notice. Checking a certificate every five minutes would only add
+# handshakes to every watched domain for news that changes once a quarter.
+OnCalendar=*-*-* 08:00:00
+RandomizedDelaySec=900
+
+# A box that was off across 08:00 still needs to hear about a certificate that
+# expires today, and unlike the five-minute check this one has something to say
+# about a window it missed.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

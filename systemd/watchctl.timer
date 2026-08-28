@@ -1,0 +1,18 @@
+[Unit]
+Description=Check watched sites every five minutes
+
+[Timer]
+# Five minutes with the default SITE_FAILURES=3 means a site is called down
+# after ~10 minutes of sustained failure: past a deploy's restart, past a
+# single upstream blip, and still inside the window where knowing helps.
+OnBootSec=5min
+OnUnitActiveSec=5min
+
+# The first check after a reboot waits out OnBootSec above rather than firing
+# immediately, so a boot does not alert about apps that are still starting.
+# Persistent= is deliberately absent for the same reason: catching up a missed
+# five-minute window tells you nothing that the next one will not.
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

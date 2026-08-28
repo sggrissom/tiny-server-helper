@@ -1,0 +1,21 @@
+[Unit]
+Description=Warn about TLS certificates close to expiry (watchctl certs)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+
+# Reads the certificate actually being served for each watched domain. A host
+# that will not answer is skipped rather than alerted on: watchctl.service is
+# already saying so every five minutes, and a second alert for one outage
+# teaches you to ignore both.
+ExecStart=/usr/local/bin/watchctl certs
+
+Nice=10
+
+# One TLS handshake per watched domain, each bounded by its own timeout.
+TimeoutStartSec=300
+
+# No [Install] section - started by watchctl-certs.timer. See watchctl.service.

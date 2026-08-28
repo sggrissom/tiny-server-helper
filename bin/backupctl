@@ -35,7 +35,7 @@ setup installs and enables the timers that make this run on its own:
   systemctl list-timers 'backupctl*'
   journalctl -u backupctl.service -g FAILED
 
-Alerts need ALERT_EMAIL set in $BACKUP_ENV.
+Alerts need ALERT_EMAIL set in $ALERT_ENV (or $BACKUP_ENV).
 EOF
 }
 
@@ -47,6 +47,12 @@ BACKUP_ENV="$TSH_DIR/backup.env"
 # domain that already has SPF and DKIM set up rather than from a bare hostname
 # that every receiver is entitled to distrust.
 MAIL_ENV="$TSH_DIR/mail.env"
+# Written by watchctl setup, and shared with it: one address for everything on
+# this box that needs your attention. Only consulted when backup.env does not
+# set ALERT_EMAIL itself, so an existing backup.env keeps working untouched.
+# Read with a grep rather than sourced - backupctl only wants one value out of
+# it, and this file is not root:600 the way backup.env is.
+ALERT_ENV="$TSH_DIR/alert.env"
 APPS_DIR="/srv/apps"
 STATE_DIR="/var/lib/tiny-server-helper/backup"
 
@@ -310,6 +316,16 @@ load_backup_env() {
   set +a
   [[ -n "${RESTIC_REPOSITORY:-}" ]] || die "RESTIC_REPOSITORY is not set in $BACKUP_ENV"
   [[ -n "${RESTIC_PASSWORD:-}" ]]   || die "RESTIC_PASSWORD is not set in $BACKUP_ENV"
+
+  # backup.env wins, so nothing that already sets ALERT_EMAIL there changes
+  # behaviour. Otherwise fall back to the shared alert.env, which is where the
+  # address belongs: knowing where to send mail should not require the ability
+  # to read the repository password.
+  if [[ -z "${ALERT_EMAIL:-}" && -f "$ALERT_ENV" ]]; then
+    ALERT_EMAIL="$(grep -E '^ALERT_EMAIL=' "$ALERT_ENV" | head -n 1 | cut -d= -f2- || true)"
+    ALERT_EMAIL="${ALERT_EMAIL%\"}"; ALERT_EMAIL="${ALERT_EMAIL#\"}"
+    ALERT_EMAIL="${ALERT_EMAIL%\'}"; ALERT_EMAIL="${ALERT_EMAIL#\'}"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -333,7 +349,7 @@ alert_from() {
 # Why alerting cannot work right now, or empty if it can. Used by both doctor
 # and check, so the two never disagree about the state of the alert path.
 alert_blocker() {
-  [[ -n "${ALERT_EMAIL:-}" ]] || { echo "ALERT_EMAIL is not set in $BACKUP_ENV"; return 0; }
+  [[ -n "${ALERT_EMAIL:-}" ]] || { echo "ALERT_EMAIL is not set in $ALERT_ENV or $BACKUP_ENV"; return 0; }
   [[ -x "$SENDMAIL" ]] || { echo "$SENDMAIL is missing - is Postfix installed? (see: mailctl doctor)"; return 0; }
   echo ""
 }
