@@ -1009,8 +1009,12 @@ ALERT_EMAIL=$email
 # How often a still-failing check re-alerts.
 #RENOTIFY_HOURS=$RENOTIFY_HOURS
 
-# Space-separated globs of systemd units never to alert on.
-#IGNORE_UNITS=certbot.service *.mount
+# Space-separated globs of systemd units never to alert on. The two below are
+# the usual suspects on a Debian VPS: both are boot-time network units that fail
+# once and then sit in \`systemctl --failed\` forever. Look at why they failed
+# before adding them - the network stack being misconfigured is worth knowing
+# once, even when it is not worth an alert every six hours.
+#IGNORE_UNITS=ifupdown-pre.service systemd-networkd-wait-online.service
 
 # Optional dead-man's switch. This box cannot mail you about its own outage;
 # watchctl pings this on every check run so something off-box can notice when

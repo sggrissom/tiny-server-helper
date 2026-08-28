@@ -479,7 +479,7 @@ DISK_WARN_PERCENT=85
 INODE_WARN_PERCENT=85
 CERT_WARN_DAYS=14
 RENOTIFY_HOURS=6
-IGNORE_UNITS=certbot.service *.mount
+IGNORE_UNITS=ifupdown-pre.service systemd-networkd-wait-online.service
 HEARTBEAT_URL=https://hc-ping.com/<uuid>
 ```
 
