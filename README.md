@@ -73,8 +73,8 @@ deploy <app> <user@host> <binary> [service_type]
 Symlink `bin/deploy` into `~/.local/bin/` so project Makefiles can call it.
 
 Each deploy uploads to a new timestamped release, flips `current`, restarts the
-unit, health-checks `http://127.0.0.1:$PORT/healthz`, rolls back on failure, and
-prunes to the last 5 releases.
+unit, polls `http://127.0.0.1:$PORT/healthz` for up to 30s (`DEPLOY_HEALTH_WAIT`
+to change it), rolls back on failure, and prunes to the last 5 releases.
 
 ## Server commands
 
