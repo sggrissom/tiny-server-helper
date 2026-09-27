@@ -39,7 +39,7 @@ echo "  release: $rel"
 echo "  keep:    $keep"
 
 # Capture previous release (if any)
-prev="$(ssh "$host" "readlink -f '$remote_root/current' || true")"
+prev="$(ssh "$host" "readlink -e '$remote_root/current' || true")"
 
 # Create release dir
 ssh "$host" "sudo mkdir -p '$remote_rel'"
