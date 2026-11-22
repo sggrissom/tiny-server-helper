@@ -88,6 +88,13 @@ watchctl status                # what is currently failing
 watchctl list                  # what is watched
 ```
 
+`appctl domain` writes a JSON access log to `/var/log/caddy/access-<app>.log`.
+If an app serves secrets in its URLs, such as share links, set
+`ACCESS_LOG_REDACT_PATH=/share/` in its `shared/.env` and rerun
+`appctl domain`. The path segment after that prefix is then logged as
+`REDACTED`. A config that fails `caddy validate` is never left in place: the
+previous one is restored and Caddy is not reloaded.
+
 ## Sending mail
 
 Outbound SMTP is a server capability, not something each site carries. One
