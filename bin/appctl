@@ -174,6 +174,20 @@ EOF
     [[ "$port" =~ ^[0-9]+$ ]] || die "PORT must be numeric, got: $port"
     (( port >= 1 && port <= 65535 )) || die "PORT out of range: $port"
 
+    # Optional: a path prefix whose next segment is a secret, such as a share
+    # token, logged as REDACTED instead.
+    redact_path=$(grep -E "^ACCESS_LOG_REDACT_PATH=" "$envfile" | tail -1 | cut -d= -f2- | tr -d "\"'" || true)
+    log_format="        format json"
+    if [[ -n "$redact_path" ]]; then
+      [[ "$redact_path" =~ ^(/[A-Za-z0-9_-]+)+/$ ]] || die "ACCESS_LOG_REDACT_PATH looks like /share/, got: $redact_path"
+      log_format="        format filter {
+            wrap json
+            fields {
+                request>uri regexp \"^${redact_path}[^/?]+\" \"${redact_path}REDACTED\"
+            }
+        }"
+    fi
+
     echo "Configuring Caddy for $app..."
     echo "  Domain: $domain"
     echo "  Port: $port"
@@ -194,7 +208,7 @@ $domain {
             roll_size 50mb
             roll_keep 3
         }
-        format json
+$log_format
     }
 }
 EOF
@@ -209,17 +223,29 @@ EOF
       exit 0
     fi
 
-    # Move config into place
+    # Move config into place, keeping the old one until the new one validates
+    backup_config=""
+    if [[ -f "$caddy_config" ]]; then
+      backup_config=$(mktemp)
+      cp -p "$caddy_config" "$backup_config"
+    fi
     mv "$temp_config" "$caddy_config"
     chmod 644 "$caddy_config"
 
     # Validate Caddy config
     echo "Validating Caddy config..."
     if ! caddy validate --config /etc/caddy/Caddyfile 2>&1; then
-      echo "Error: Caddy config validation failed"
-      echo "Config created at $caddy_config but Caddy not reloaded"
+      echo "Error: Caddy config validation failed; Caddy not reloaded"
+      if [[ -n "$backup_config" ]]; then
+        mv "$backup_config" "$caddy_config"
+        echo "Restored the previous $caddy_config"
+      else
+        rm -f "$caddy_config"
+        echo "Removed the new $caddy_config"
+      fi
       exit 1
     fi
+    [[ -z "$backup_config" ]] || rm -f "$backup_config"
 
     # Reload Caddy
     echo "Reloading Caddy..."
@@ -227,6 +253,7 @@ EOF
       echo "✅ Domain configured successfully"
       echo "   $domain → localhost:$port"
       echo "   Access log: /var/log/caddy/access-${app}.log"
+      [[ -z "$redact_path" ]] || echo "   Redacted in log: ${redact_path}<token>"
       echo ""
       echo "Next steps:"
       echo "  1. Ensure DNS points to this server"
